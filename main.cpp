@@ -141,7 +141,7 @@ int main()
         model  = glm::mat4(1.0f);
         model  = glm::translate(model,modelPos);
         model  = glm::scale(model,{0.03f,0.03f,0.03f});
-        model  = glm::rotate(model,glm::radians(180.0f),{0.0f,1.0f,0.0f});
+        model  = glm::rotate(model, glm::radians(modelYaw),{0.0f,1.0f,0.0f});
         model  = glm::rotate(model,glm::radians( 90.0f),{-1.0f,0.0f,0.0f});
         modelShader.setMat4("model",model);
         carModel.Draw(modelShader);
@@ -163,14 +163,14 @@ void processInput(GLFWwindow* window)
     if (glfwGetKey(window,GLFW_KEY_ESCAPE)==GLFW_PRESS)
         glfwSetWindowShouldClose(window,true);
 
-    float speed = 1.0f * deltaTime;
-    glm::vec3 horizFront = glm::normalize(glm::vec3(cameraFront.x,0.0f,cameraFront.z));
-    glm::vec3 horizRight = glm::normalize(glm::cross(horizFront,cameraUp));
-
-    if (glfwGetKey(window,GLFW_KEY_W)==GLFW_PRESS){ cameraPos += speed*horizFront; modelPos += speed*horizFront; }
-    if (glfwGetKey(window,GLFW_KEY_S)==GLFW_PRESS){ cameraPos -= speed*horizFront; modelPos -= speed*horizFront; }
-    if (glfwGetKey(window,GLFW_KEY_A)==GLFW_PRESS){ cameraPos -= speed*horizRight; modelPos -= speed*horizRight; modelYaw += 90.0f*deltaTime; }
-    if (glfwGetKey(window,GLFW_KEY_D)==GLFW_PRESS){ cameraPos += speed*horizRight; modelPos += speed*horizRight; modelYaw -= 90.0f*deltaTime; }
+    float speed = 0.2f * deltaTime;
+    const float yawRad = glm::radians(modelYaw);     // Y-axis yaw (degrees → rad)
+    glm::vec3 carForward = glm::vec3(sin(yawRad), 0.0f, cos(yawRad));
+    glm::vec3 carRight = glm::normalize(glm::cross(carForward, cameraUp));
+    if (glfwGetKey(window,GLFW_KEY_W)==GLFW_PRESS){ cameraPos += speed*carForward; modelPos += speed*carForward; }
+    if (glfwGetKey(window,GLFW_KEY_S)==GLFW_PRESS){ cameraPos -= speed*carForward; modelPos -= speed*carForward; }
+    if (glfwGetKey(window,GLFW_KEY_A)==GLFW_PRESS){ modelYaw += 90.0f*deltaTime; }
+    if (glfwGetKey(window,GLFW_KEY_D)==GLFW_PRESS){ modelYaw -= 90.0f*deltaTime; }
 }
 
 void framebuffer_size_callback(GLFWwindow*,int w,int h){ glViewport(0,0,w,h); }
