@@ -13,8 +13,6 @@
 				"-g",
 				"-I${workspaceFolder}/res",
 				"-I${workspaceFolder}/dependencies/include",
-				"-I${workspaceFolder}/dependencies/include/GLM/include",
-				"-I${workspaceFolder}/dependencies/include/assimp/include",
 				"-L${workspaceFolder}/dependencies/library",
 				"${workspaceFolder}/main.cpp",
 				"${workspaceFolder}/glad.c",

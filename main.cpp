@@ -65,7 +65,7 @@ int main()
 #endif
 
     // 2. window
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH,SCR_HEIGHT,"LearnOpenGL (no-ImGui)",nullptr,nullptr);
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH,SCR_HEIGHT,"APEX SLIDE",nullptr,nullptr);
     if (!window){ std::cerr<<"Failed to create window\n"; glfwTerminate(); return -1; }
     glfwMakeContextCurrent(window);
 
