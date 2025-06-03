@@ -1,5 +1,5 @@
 # Vehicle‑Replay
-![PixPin_2025-06-03_16-43-13-ezgif com-loop-count](https://github.com/user-attachments/assets/54f45cf8-ae15-4ae7-a755-e24af564fdb7)
+![PixPin_2025-06-03_17-20-45-ezgif com-loop-count](https://github.com/user-attachments/assets/ad6b6eab-66ba-4ad9-bfd2-a5432c9dd194)
 
 ## 1 · Install Homebrew packages
 
