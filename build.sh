@@ -1,0 +1,31 @@
+#!/bin/bash
+source .env
+
+WORKSPACE=$WORKSPACE_PATH # Replace with your actual workspace path
+
+clang++ -std=c++17 -fcolor-diagnostics -Wall -fansi-escape-codes -g \
+    -I${WORKSPACE} \
+    -I${WORKSPACE}/res \
+    -I${WORKSPACE}/dependencies/include \
+    -I/opt/homebrew/include \
+    -I/opt/homebrew/opt/abseil/include \
+    -I/opt/homebrew/opt/openssl@3/include \
+    -L${WORKSPACE}/dependencies/library \
+    -L/opt/homebrew/lib \
+    -L/opt/homebrew/opt/abseil/lib \
+    -L/opt/homebrew/opt/openssl@3/lib \
+    ${WORKSPACE}/main.cpp \
+    ${WORKSPACE}/car_pose.pb.cc \
+    ${WORKSPACE}/glad.c \
+    ${WORKSPACE}/dependencies/library/libglfw.3.4.dylib \
+    ${WORKSPACE}/dependencies/library/libassimp.5.4.3.dylib \
+    -lwebsockets \
+    $(pkg-config --cflags protobuf absl_log) \
+    $(pkg-config --libs protobuf absl_log) \
+    -framework OpenGL \
+    -framework Cocoa \
+    -framework IOKit \
+    -framework CoreVideo \
+    -framework CoreFoundation \
+    -o ${WORKSPACE}/app \
+    -Wno-deprecated
