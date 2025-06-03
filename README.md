@@ -1,4 +1,5 @@
 # Vehicle‑Replay
+![PixPin_2025-06-03_16-43-13-ezgif com-loop-count](https://github.com/user-attachments/assets/54f45cf8-ae15-4ae7-a755-e24af564fdb7)
 
 ## 1 · Install Homebrew packages
 
@@ -21,7 +22,6 @@ brew install glfw assimp glm   # graphics stack
 
 </details>
 
----
 
 ## 2 · Generate protobuf sources
 If you dirst clone this repo or ever add or edit a .proto, run once:
@@ -30,7 +30,6 @@ If you dirst clone this repo or ever add or edit a .proto, run once:
 protoc -I . --cpp_out=. car_pose.proto
 ```
 
----
 
 ## 3 · Configure workspace path
 
@@ -42,7 +41,6 @@ WORKSPACE_PATH=/absolute/path/to/vehicle-replay
 
 Change the value after `=` to the real location of **this** repository (e.g. `/Users/<you>/Projects/vehicle-replay`).
 
----
 
 ## 4 · Build & run
 
