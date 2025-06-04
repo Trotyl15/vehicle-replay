@@ -7,6 +7,7 @@ clang++ -std=c++17 -fcolor-diagnostics -Wall -fansi-escape-codes -g \
     -I${WORKSPACE} \
     -I${WORKSPACE}/res \
     -I${WORKSPACE}/dependencies/include \
+    -I${WORKSPACE}/imgui \
     -I/opt/homebrew/include \
     -I/opt/homebrew/opt/abseil/include \
     -I/opt/homebrew/opt/openssl@3/include \
@@ -17,6 +18,13 @@ clang++ -std=c++17 -fcolor-diagnostics -Wall -fansi-escape-codes -g \
     ${WORKSPACE}/main.cpp \
     ${WORKSPACE}/car_pose.pb.cc \
     ${WORKSPACE}/glad.c \
+    ${WORKSPACE}/imgui/imgui.cpp \
+    ${WORKSPACE}/imgui/imgui_demo.cpp \
+    ${WORKSPACE}/imgui/imgui_draw.cpp \
+    ${WORKSPACE}/imgui/imgui_tables.cpp \
+    ${WORKSPACE}/imgui/imgui_widgets.cpp \
+    ${WORKSPACE}/imgui/imgui_impl_glfw.cpp \
+    ${WORKSPACE}/imgui/imgui_impl_opengl3.cpp \
     ${WORKSPACE}/dependencies/library/libglfw.3.4.dylib \
     ${WORKSPACE}/dependencies/library/libassimp.5.4.3.dylib \
     -lwebsockets \
