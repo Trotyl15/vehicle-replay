@@ -42,8 +42,11 @@ public:
     // draws the model, and thus all its meshes
     void Draw(Shader& shader)
     {
-        for (unsigned int i = 0; i < meshes.size(); i++)
+        for (unsigned int i = 0; i < meshes.size(); i++) {
+            // Set isCarPaint uniform based on material name
+            shader.setBool("isCarPaint", meshes[i].material.name == "CarPaint");
             meshes[i].Draw(shader);
+        }
     }
 
 private:
@@ -151,6 +154,16 @@ private:
         aiColor4D baseColor;
         if (AI_SUCCESS == material->Get(AI_MATKEY_COLOR_DIFFUSE, baseColor)) {
             mat.baseColor = glm::vec4(baseColor.r, baseColor.g, baseColor.b, baseColor.a);
+        }
+
+        // Get material name
+        aiString matName;
+        material->Get(AI_MATKEY_NAME, matName);
+        mat.name = matName.C_Str();
+
+        // Set white color only for CarPaint material
+        if (mat.name == "CarPaint") {
+            mat.baseColor = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
         }
 
         float metallic, roughness;

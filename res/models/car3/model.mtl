@@ -1,0 +1,19 @@
+# exported by https://3dviewer.net
+newmtl CarPaint
+Kd 0.11372549019607843 0.7333333333333333 0.9098039215686274
+d 1
+newmtl Window
+Kd 0 0 0
+d 1
+newmtl FrontLight
+Kd 1 0.7764705882352941 0.3764705882352941
+d 1
+newmtl Plastic
+Kd 0 0 0
+d 1
+newmtl RearLight
+Kd 1 0 0
+d 1
+newmtl Rims
+Kd 0.6823529411764706 0.6823529411764706 0.6823529411764706
+d 1

@@ -42,6 +42,7 @@ struct Material {
     glm::vec4 baseColor = glm::vec4(1.0f);
     float metallic = 0.0f;
     float roughness = 1.0f;
+    std::string name;
 };
 
 class Mesh {

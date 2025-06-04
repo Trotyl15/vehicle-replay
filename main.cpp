@@ -57,6 +57,15 @@ bool csvFileSelected = false;
 GLuint framebuffer, textureColorbuffer;
 int viewportWidth = 800, viewportHeight = 800;
 bool show3DView = true;
+glm::vec3 carColor(32.0f/255.0f, 139.0f/255.0f, 215.0f/255.0f);  // Default blue color
+
+// Lighting parameters
+struct Light {
+    glm::vec3 direction = glm::vec3(-0.2f, -1.0f, -0.3f);
+    glm::vec3 ambient = glm::vec3(0.2f);
+    glm::vec3 diffuse = glm::vec3(0.5f);
+    glm::vec3 specular = glm::vec3(1.0f);
+} light;
 
 // ───────────────────────────────────────────────────────────
 // geo-math constants
@@ -190,7 +199,8 @@ int main()
         "res/shaders/model.fs",
         "res/shaders/track.vs",
         "res/shaders/track.fs",
-        "res/models/car2/scene.gltf"
+        "res/models/car2/scene.gltf",
+        "res/models/car3/model.obj"
     };
 
     std::cout << "Checking required files..." << std::endl;
@@ -295,7 +305,7 @@ int main()
     std::cout << "Loading car model..." << std::endl;
     Model* car = nullptr;
     try {
-        car = new Model("res/models/car2/scene.gltf");
+        car = new Model("res/models/car3/model.obj");
         std::cout << "Car model loaded" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Error loading car model: " << e.what() << std::endl;
@@ -339,6 +349,9 @@ int main()
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // Enable docking
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // Enable viewports
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    
+    // Load settings from INI file
+    ImGui::LoadIniSettingsFromDisk("imgui.ini");
     
     // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(win, true);
@@ -416,16 +429,59 @@ int main()
             mFileDialog.SetTypeFilters({ ".csv" });
             ImGui::Separator();
 
+            // Car Color Selection
+            ImGui::Text("Car Color:");
+            float color[3] = { carColor.r, carColor.g, carColor.b };
+            if (ImGui::ColorEdit3("##CarColor", color))
+            {
+                carColor = glm::vec3(color[0], color[1], color[2]);
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when color changes
+            }
+            ImGui::Separator();
+
+            // Lighting Controls
+            ImGui::Text("Lighting Controls");
+            float lightDir[3] = { light.direction.x, light.direction.y, light.direction.z };
+            if (ImGui::SliderFloat3("Light Direction", lightDir, -1.0f, 1.0f))
+            {
+                light.direction = glm::vec3(lightDir[0], lightDir[1], lightDir[2]);
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when light direction changes
+            }
+            
+            float ambient[3] = { light.ambient.r, light.ambient.g, light.ambient.b };
+            if (ImGui::ColorEdit3("Ambient Light", ambient))
+            {
+                light.ambient = glm::vec3(ambient[0], ambient[1], ambient[2]);
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when ambient light changes
+            }
+            
+            float diffuse[3] = { light.diffuse.r, light.diffuse.g, light.diffuse.b };
+            if (ImGui::ColorEdit3("Diffuse Light", diffuse))
+            {
+                light.diffuse = glm::vec3(diffuse[0], diffuse[1], diffuse[2]);
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when diffuse light changes
+            }
+            
+            float specular[3] = { light.specular.r, light.specular.g, light.specular.b };
+            if (ImGui::ColorEdit3("Specular Light", specular))
+            {
+                light.specular = glm::vec3(specular[0], specular[1], specular[2]);
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when specular light changes
+            }
+            ImGui::Separator();
+
             // Mode Selection
             ImGui::Text("Control Mode:");
             if (ImGui::RadioButton("Manual", manualMode))
             {
                 manualMode = true;
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when mode changes
             }
             ImGui::SameLine();
             if (ImGui::RadioButton("Automatic", !manualMode))
             {
                 manualMode = false;
+                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when mode changes
             }
 
             ImGui::Separator();
@@ -525,11 +581,19 @@ int main()
             modelShader->use();
             modelShader->setMat4("projection", proj);
             modelShader->setMat4("view", view);
+            modelShader->setVec3("carColor", carColor);
+            modelShader->setVec3("viewPos", cameraPos);
+            
+            // Set lighting uniforms
+            modelShader->setVec3("light.direction", light.direction);
+            modelShader->setVec3("light.ambient", light.ambient);
+            modelShader->setVec3("light.diffuse", light.diffuse);
+            modelShader->setVec3("light.specular", light.specular);
+
             model = glm::mat4(1.0f);
             model = glm::translate(model, modelPos);
             model = glm::scale(model, {0.03f, 0.03f, 0.03f});
             model = glm::rotate(model, glm::radians(modelYaw), {0.0f, 1.0f, 0.0f});
-            model = glm::rotate(model, glm::radians(90.0f), {-1.0f, 0.0f, 0.0f});
             modelShader->setMat4("model", model);
             car->Draw(*modelShader);
 
@@ -594,6 +658,7 @@ int main()
     // Cleanup ImGui
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
+    ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save settings before shutdown
     ImGui::DestroyContext();
 
     std::cout << "Cleaning up..." << std::endl;
