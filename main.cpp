@@ -35,7 +35,7 @@
 // ───────────────────────────────────────────────────────────
 // window / camera globals
 // ───────────────────────────────────────────────────────────
-const unsigned SCR_WIDTH = 800, SCR_HEIGHT = 600;
+const unsigned SCR_WIDTH = 1200, SCR_HEIGHT = 800;
 glm::vec3 cameraPos{0,2.1f,3}, cameraFront{0,-0.05,-1}, cameraUp{0,1,0};
 glm::vec3 modelPos{0,2,2.7f};
 float modelYaw = 180.0f, deltaTime = 0, lastFrame = 0, fov = 45;
@@ -47,13 +47,16 @@ std::string mCurrentFile = "< ... >";
 std::deque<glm::vec3> trackPoints;
 const size_t MAX_TRACK_POINTS = 1000;  // Maximum number of points to store
 GLuint trackVAO, trackVBO;
-
 // UI state
 bool showSettings = true;
 bool manualMode = true;
 bool cameraLocked = true;
 char csvFilePath[256] = "";
 bool csvFileSelected = false;
+// Add after other global variables
+GLuint framebuffer, textureColorbuffer;
+int viewportWidth = 800, viewportHeight = 800;
+bool show3DView = true;
 
 // ───────────────────────────────────────────────────────────
 // geo-math constants
@@ -333,11 +336,36 @@ int main()
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // Enable docking
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;  // Enable viewports
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     
     // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 330");
+
+    // Create framebuffer for 3D view
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+
+    // Create texture attachment
+    glGenTextures(1, &textureColorbuffer);
+    glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, viewportWidth, viewportHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
+
+    // Create renderbuffer object for depth and stencil attachment
+    GLuint rbo;
+    glGenRenderbuffers(1, &rbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, viewportWidth, viewportHeight);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cout << "ERROR::FRAMEBUFFER:: Framebuffer is not complete!" << std::endl;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     std::cout << "Entering main loop..." << std::endl;
     while(!glfwWindowShouldClose(win))
@@ -350,6 +378,25 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Create dock space
+        ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->Pos);
+        ImGui::SetNextWindowSize(viewport->Size);
+        ImGui::SetNextWindowViewport(viewport->ID);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+
+        ImGuiWindowFlags window_flags = ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoDocking;
+        window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+        window_flags |= ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus;
+
+        ImGui::Begin("DockSpace", nullptr, window_flags);
+        ImGui::PopStyleVar(3);
+
+        ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
+        ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
+
         // Settings window
         if (showSettings)
         {
@@ -360,13 +407,10 @@ int main()
             ImGui::SameLine();
             if (ImGui::Button("Select CSV"))
             {
-                
                 mFileDialog.Open();
-                
             }
             ImGui::SameLine();
             ImGui::Text("%s", mCurrentFile.c_str());
-            
 
             mFileDialog.SetTitle("Open csv");
             mFileDialog.SetTypeFilters({ ".csv" });
@@ -393,10 +437,115 @@ int main()
             mFileDialog.Display();
             if (mFileDialog.HasSelected())
             {
-            auto file_path = mFileDialog.GetSelected().string();
-            mCurrentFile = file_path.substr(file_path.find_last_of("/\\") + 1);
+                auto file_path = mFileDialog.GetSelected().string();
+                mCurrentFile = file_path.substr(file_path.find_last_of("/\\") + 1);
             }
         }
+
+        // 3D View window
+        if (show3DView)
+        {
+            ImGui::Begin("3D View", &show3DView);
+            
+            // Get the size of the ImGui window
+            ImVec2 windowSize = ImGui::GetContentRegionAvail();
+            if (windowSize.x != viewportWidth || windowSize.y != viewportHeight)
+            {
+                viewportWidth = (int)windowSize.x;
+                viewportHeight = (int)windowSize.y;
+                
+                // Resize framebuffer texture
+                glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, viewportWidth, viewportHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+                glBindRenderbuffer(GL_RENDERBUFFER, rbo);
+                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, viewportWidth, viewportHeight);
+            }
+
+            // Render 3D scene to framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            glViewport(0, 0, viewportWidth, viewportHeight);
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            // Calculate view and projection matrices
+            glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
+            glm::mat4 proj = glm::perspective(glm::radians(fov), (float)viewportWidth/(float)viewportHeight, 0.1f, 100.0f);
+
+            // Render track
+            if (!trackPoints.empty()) {
+                trackShader->use();
+                trackShader->setMat4("projection", proj);
+                trackShader->setMat4("view", view);
+                trackShader->setMat4("model", glm::mat4(1.0f));
+                trackShader->setVec4("trackColor", glm::vec4(11.0f/255.0f, 48.0f/255.0f, 47.0f/255.0f, 1.0f));
+
+                glBindVertexArray(trackVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, trackVBO);
+                
+                std::vector<glm::vec3> points(trackPoints.begin(), trackPoints.end());
+                std::vector<glm::vec3> quadVertices;
+                const float trackWidth = 0.03f;
+                const float overlap = 0.005f;
+                const float heightOffset = -0.001f;
+                
+                for (size_t i = 0; i < points.size() - 1; ++i) {
+                    glm::vec3 current = points[i];
+                    glm::vec3 next = points[i + 1];
+                    current.y += heightOffset;
+                    next.y += heightOffset;
+                    
+                    glm::vec3 dir = glm::normalize(next - current);
+                    glm::vec3 perp = glm::normalize(glm::cross(dir, glm::vec3(0.0f, 1.0f, 0.0f)));
+                    glm::vec3 offset = perp * trackWidth;
+                    glm::vec3 dirOffset = dir * overlap;
+                    
+                    quadVertices.push_back(current + offset - dirOffset);
+                    quadVertices.push_back(current - offset - dirOffset);
+                    quadVertices.push_back(next + offset + dirOffset);
+                    quadVertices.push_back(current - offset - dirOffset);
+                    quadVertices.push_back(next - offset + dirOffset);
+                    quadVertices.push_back(next + offset + dirOffset);
+                }
+                
+                glBufferData(GL_ARRAY_BUFFER, quadVertices.size() * sizeof(glm::vec3), quadVertices.data(), GL_DYNAMIC_DRAW);
+                glDrawArrays(GL_TRIANGLES, 0, quadVertices.size());
+                glBindVertexArray(0);
+            }
+
+            // Render grid
+            gridShader->use();
+            glm::mat4 model = glm::mat4(1.0f);
+            glm::mat4 gVP = proj * view * model;
+            glUniformMatrix4fv(glGetUniformLocation(gridShader->ID,"gVP"),1,GL_FALSE,glm::value_ptr(gVP));
+            glUniform3fv(glGetUniformLocation(gridShader->ID,"gCameraWorldPos"),1,glm::value_ptr(cameraPos));
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLES,0,6);
+
+            // Render car model
+            modelShader->use();
+            modelShader->setMat4("projection", proj);
+            modelShader->setMat4("view", view);
+            model = glm::mat4(1.0f);
+            model = glm::translate(model, modelPos);
+            model = glm::scale(model, {0.03f, 0.03f, 0.03f});
+            model = glm::rotate(model, glm::radians(modelYaw), {0.0f, 1.0f, 0.0f});
+            model = glm::rotate(model, glm::radians(90.0f), {-1.0f, 0.0f, 0.0f});
+            modelShader->setMat4("model", model);
+            car->Draw(*modelShader);
+
+            // Reset framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+            // Display the rendered texture in ImGui with flipped UV coordinates
+            ImGui::Image((ImTextureID)(uintptr_t)textureColorbuffer, 
+                        ImVec2(viewportWidth, viewportHeight),
+                        ImVec2(0, 1),  // UV0: bottom-left
+                        ImVec2(1, 0)); // UV1: top-right
+
+            ImGui::End();
+        }
+
+        ImGui::End(); // End the dock space window
 
         /* update from WS */
         {
@@ -426,117 +575,18 @@ int main()
         glViewport(0,0,w,h);
         glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
 
-        // Calculate view and projection matrices once per frame
-        glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
-        glm::mat4 proj = glm::perspective(glm::radians(fov), (float)SCR_WIDTH/(float)SCR_HEIGHT, 0.1f, 100.0f);
-
-        // Render track first (underneath the grid)
-        if (!trackPoints.empty()) {  // Only render if we have points
-            try {
-                if (!trackShader) {
-                    std::cerr << "Track shader is null" << std::endl;
-                    continue;
-                }
-                trackShader->use();
-                trackShader->setMat4("projection", proj);
-                trackShader->setMat4("view", view);
-                trackShader->setMat4("model", glm::mat4(1.0f));
-                trackShader->setVec4("trackColor", glm::vec4(11.0f/255.0f, 48.0f/255.0f, 47.0f/255.0f, 1.0f));  // Dark teal color
-
-                glBindVertexArray(trackVAO);
-                glBindBuffer(GL_ARRAY_BUFFER, trackVBO);
-                
-                // Convert deque to vector for OpenGL
-                std::vector<glm::vec3> points(trackPoints.begin(), trackPoints.end());
-                
-                // Create quad vertices for the track
-                std::vector<glm::vec3> quadVertices;
-                const float trackWidth = 0.03f;  // Width of the track
-                const float overlap = 0.005f;    // Increased overlap to prevent gaps
-                const float heightOffset = -0.001f; // Negative height offset to place track below grid
-                
-                for (size_t i = 0; i < points.size() - 1; ++i) {
-                    glm::vec3 current = points[i];
-                    glm::vec3 next = points[i + 1];
-                    
-                    // Add small height offset to prevent z-fighting
-                    current.y += heightOffset;
-                    next.y += heightOffset;
-                    
-                    // Calculate direction vector
-                    glm::vec3 dir = glm::normalize(next - current);
-                    // Calculate perpendicular vector for width
-                    glm::vec3 perp = glm::normalize(glm::cross(dir, glm::vec3(0.0f, 1.0f, 0.0f)));
-                    
-                    // Create quad vertices with increased overlap
-                    glm::vec3 offset = perp * trackWidth;
-                    glm::vec3 dirOffset = dir * overlap;
-                    
-                    // First triangle
-                    quadVertices.push_back(current + offset - dirOffset);
-                    quadVertices.push_back(current - offset - dirOffset);
-                    quadVertices.push_back(next + offset + dirOffset);
-                    
-                    // Second triangle
-                    quadVertices.push_back(current - offset - dirOffset);
-                    quadVertices.push_back(next - offset + dirOffset);
-                    quadVertices.push_back(next + offset + dirOffset);
-                }
-                
-                // Update buffer with quad vertices
-                glBufferData(GL_ARRAY_BUFFER, quadVertices.size() * sizeof(glm::vec3), quadVertices.data(), GL_DYNAMIC_DRAW);
-                
-                // Draw as triangles instead of line strip
-                glDrawArrays(GL_TRIANGLES, 0, quadVertices.size());
-                
-                glBindVertexArray(0);  // Unbind track VAO
-            } catch (const std::exception& e) {
-                std::cerr << "Error rendering track: " << e.what() << std::endl;
-            }
-        }
-
-        // Render grid after track
-        try {
-            if (!gridShader) {
-                std::cerr << "Grid shader is null" << std::endl;
-                continue;
-            }
-            gridShader->use();
-            glm::mat4 model = glm::mat4(1.0f);
-            glm::mat4 gVP = proj * view * model;
-
-            glUniformMatrix4fv(glGetUniformLocation(gridShader->ID,"gVP"),1,GL_FALSE,glm::value_ptr(gVP));
-            glUniform3fv(glGetUniformLocation(gridShader->ID,"gCameraWorldPos"),1,glm::value_ptr(cameraPos));
-            glBindVertexArray(VAO);
-            glDrawArrays(GL_TRIANGLES,0,6);
-        } catch (const std::exception& e) {
-            std::cerr << "Error rendering grid: " << e.what() << std::endl;
-        }
-
-        // Render car model last
-        try {
-            if (!modelShader || !car) {
-                std::cerr << "Model shader or car model is null" << std::endl;
-                continue;
-            }
-            modelShader->use();
-            modelShader->setMat4("projection", proj);
-            modelShader->setMat4("view", view);
-
-            glm::mat4 model = glm::mat4(1.0f);
-            model = glm::translate(model, modelPos);
-            model = glm::scale(model, {0.03f, 0.03f, 0.03f});
-            model = glm::rotate(model, glm::radians(modelYaw), {0.0f, 1.0f, 0.0f});
-            model = glm::rotate(model, glm::radians(90.0f), {-1.0f, 0.0f, 0.0f});
-            modelShader->setMat4("model", model);
-            car->Draw(*modelShader);
-        } catch (const std::exception& e) {
-            std::cerr << "Error rendering car model: " << e.what() << std::endl;
-        }
-
         // Render ImGui
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Update and Render additional Platform Windows
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        {
+            GLFWwindow* backup_current_context = glfwGetCurrentContext();
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+            glfwMakeContextCurrent(backup_current_context);
+        }
 
         glfwSwapBuffers(win);
     }
