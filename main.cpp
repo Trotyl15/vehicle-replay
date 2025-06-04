@@ -67,19 +67,43 @@ glm::vec3 carColor(32.0f/255.0f, 139.0f/255.0f, 215.0f/255.0f);  // Default blue
 bool topDownView = false;  // New camera view mode
 glm::vec3 topDownOffset(0.0f, 5.0f, 0.0f);  // Camera offset for top-down view
 glm::vec3 followOffset(0.0f, 0.1f, 0.3f);   // Camera offset for follow view
+glm::vec3 lockedCameraFront{0.0f, 0.0f, -1.0f};  // Store the camera orientation when locked
+bool wasLocked = false;  // Track if camera was previously locked
 
 // Function to update camera position and orientation
 void updateCamera() {
     if (topDownView) {
-        // In top-down view, camera follows car from above
-        cameraPos = modelPos + topDownOffset;
-        cameraFront = glm::vec3(0.0f, -1.0f, 0.0f);  // Look straight down
-        cameraUp = glm::vec3(0.0f, 0.0f, -1.0f);     // Adjust up vector for top-down view
+        if (cameraLocked) {
+            // In top-down view, camera follows car from above only when locked
+            cameraPos = modelPos + topDownOffset;
+            cameraFront = glm::vec3(0.0f, -1.0f, 0.0f);  // Look straight down
+            cameraUp = glm::vec3(0.0f, 0.0f, -1.0f);     // Adjust up vector for top-down view
+        }
+        // When unlocked in top-down view, keep camera position and orientation unchanged
     } else {
-        // Original follow camera behavior
-        cameraPos = followOffset + modelPos;
-        cameraFront = glm::vec3(0.0f, -0.05f, -1.0f);
-        cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        // Calculate camera position based on car's position and orientation
+        const float yawRad = glm::radians(modelYaw);
+        glm::vec3 carForward = glm::vec3(sin(yawRad), 0.0f, cos(yawRad));
+        glm::vec3 carRight = glm::vec3(cos(yawRad), 0.0f, -sin(yawRad));
+        
+        // Position camera behind and slightly above the car
+        cameraPos = modelPos + followOffset;
+        
+        if (cameraLocked) {
+            // Store the current camera orientation when first entering locked mode
+            if (!wasLocked) {
+                lockedCameraFront = cameraFront;
+                wasLocked = true;
+            }
+            // Maintain the stored camera orientation
+            cameraFront = lockedCameraFront;
+            cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        } else {
+            wasLocked = false;
+            // In unlocked mode, keep the current cameraFront (set by mouse movement)
+            // but ensure camera follows the car's position
+            cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        }
     }
 }
 
@@ -933,7 +957,8 @@ int main()
                 modelPos.z = (float)(-enu.y * 0.025);  // north→ -Z
                 modelYaw   = 180.f - (float)(pose.head*180/M_PI);
                 
-                if (!cameraLocked) {
+                // Always update camera in replay mode, or when unlocked in live mode
+                if (replayMode || !cameraLocked) {
                     updateCamera();
                 }
             }
@@ -1009,27 +1034,19 @@ void processInput(GLFWwindow* window, bool manual)
     glm::vec3 carForward = glm::vec3(sin(yawRad), 0.0f, cos(yawRad));
     if (glfwGetKey(window,GLFW_KEY_W)==GLFW_PRESS){ 
         modelPos += speed*carForward; 
-        if (!cameraLocked) {
-            updateCamera();
-        }
+        updateCamera();
     }
     if (glfwGetKey(window,GLFW_KEY_S)==GLFW_PRESS){ 
         modelPos -= speed*carForward; 
-        if (!cameraLocked) {
-            updateCamera();
-        }
+        updateCamera();
     }
     if (glfwGetKey(window,GLFW_KEY_A)==GLFW_PRESS){ 
         modelYaw += 90.0f*deltaTime; 
-        if (!cameraLocked) {
-            updateCamera();
-        }
+        updateCamera();
     }
     if (glfwGetKey(window,GLFW_KEY_D)==GLFW_PRESS){ 
         modelYaw -= 90.0f*deltaTime; 
-        if (!cameraLocked) {
-            updateCamera();
-        }
+        updateCamera();
     }
 }
 void framebuffer_size_callback(GLFWwindow*,int w,int h){ glViewport(0,0,w,h); }
