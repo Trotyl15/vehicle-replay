@@ -26,6 +26,8 @@
 #include <vector>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -43,6 +45,8 @@ float lastX=400,lastY=300, yaw=-90,pitch=0; bool firstMouse=true;
 Assimp::Importer importer;
 ImGui::FileBrowser mFileDialog;
 std::string mCurrentFile = "< ... >";
+std::string mSelectedCsvPath;
+
 // Track visualization
 std::deque<glm::vec3> trackPoints;
 const size_t MAX_TRACK_POINTS = 1000;  // Maximum number of points to store
@@ -50,14 +54,34 @@ GLuint trackVAO, trackVBO;
 // UI state
 bool showSettings = true;
 bool manualMode = true;
+bool replayMode = false;  // New mode for CSV replay
 bool cameraLocked = true;
 char csvFilePath[256] = "";
 bool csvFileSelected = false;
+float replayProgress = 0.0f;  // Progress bar value (0.0 to 1.0)
 // Add after other global variables
 GLuint framebuffer, textureColorbuffer;
 int viewportWidth = 800, viewportHeight = 800;
 bool show3DView = true;
 glm::vec3 carColor(32.0f/255.0f, 139.0f/255.0f, 215.0f/255.0f);  // Default blue color
+bool topDownView = false;  // New camera view mode
+glm::vec3 topDownOffset(0.0f, 5.0f, 0.0f);  // Camera offset for top-down view
+glm::vec3 followOffset(0.0f, 0.1f, 0.3f);   // Camera offset for follow view
+
+// Function to update camera position and orientation
+void updateCamera() {
+    if (topDownView) {
+        // In top-down view, camera follows car from above
+        cameraPos = modelPos + topDownOffset;
+        cameraFront = glm::vec3(0.0f, -1.0f, 0.0f);  // Look straight down
+        cameraUp = glm::vec3(0.0f, 0.0f, -1.0f);     // Adjust up vector for top-down view
+    } else {
+        // Original follow camera behavior
+        cameraPos = followOffset + modelPos;
+        cameraFront = glm::vec3(0.0f, -0.05f, -1.0f);
+        cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+}
 
 // Lighting parameters
 struct Light {
@@ -66,6 +90,50 @@ struct Light {
     glm::vec3 diffuse = glm::vec3(0.5f);
     glm::vec3 specular = glm::vec3(1.0f);
 } light;
+
+// Function to save lighting settings
+void SaveLightingSettings() {
+    std::ofstream outFile("lighting.ini");
+    if (outFile.is_open()) {
+        outFile << "Direction=" << light.direction.x << "," << light.direction.y << "," << light.direction.z << "\n";
+        outFile << "Ambient=" << light.ambient.x << "," << light.ambient.y << "," << light.ambient.z << "\n";
+        outFile << "Diffuse=" << light.diffuse.x << "," << light.diffuse.y << "," << light.diffuse.z << "\n";
+        outFile << "Specular=" << light.specular.x << "," << light.specular.y << "," << light.specular.z << "\n";
+        outFile.close();
+    }
+}
+
+// Function to load lighting settings
+void LoadLightingSettings() {
+    std::ifstream inFile("lighting.ini");
+    if (!inFile.is_open()) return;
+
+    std::string line;
+    while (std::getline(inFile, line)) {
+        std::istringstream iss(line);
+        std::string key, value;
+        if (std::getline(iss, key, '=') && std::getline(iss, value)) {
+            std::istringstream valueStream(value);
+            std::string x, y, z;
+            
+            if (std::getline(valueStream, x, ',') && 
+                std::getline(valueStream, y, ',') && 
+                std::getline(valueStream, z)) {
+                
+                if (key == "Direction") {
+                    light.direction = glm::vec3(std::stof(x), std::stof(y), std::stof(z));
+                } else if (key == "Ambient") {
+                    light.ambient = glm::vec3(std::stof(x), std::stof(y), std::stof(z));
+                } else if (key == "Diffuse") {
+                    light.diffuse = glm::vec3(std::stof(x), std::stof(y), std::stof(z));
+                } else if (key == "Specular") {
+                    light.specular = glm::vec3(std::stof(x), std::stof(y), std::stof(z));
+                }
+            }
+        }
+    }
+    inFile.close();
+}
 
 // ───────────────────────────────────────────────────────────
 // geo-math constants
@@ -85,10 +153,201 @@ inline glm::dvec2 llToENU(double lat, double lon)
 }
 
 // ───────────────────────────────────────────────────────────
-// shared pose from WS thread
+// shared pose from WS & CSV threads
 // ───────────────────────────────────────────────────────────
 struct Pose { double lat,lon,head; bool valid=false; };
 Pose pose; std::mutex poseMtx; std::atomic_bool stopWS{false};
+
+// ───────────────────────────────────────────────────────────
+// CSV playback helper
+// ───────────────────────────────────────────────────────────
+class CSVPlayer {
+public:
+    CSVPlayer() : stopFlag(false), isPaused(false), seeking(false), totalRows(0), currentRow(0), totalTime(0.0), currentTime(0.0) {}
+    ~CSVPlayer(){ stopAndJoin(); }
+
+    void play(const std::string& path, bool loop=true) {
+        stopAndJoin();
+        stopFlag = false;
+        isPaused = false;
+        seeking = false;
+        totalRows = 0;
+        currentRow = 0;
+        totalTime = 0.0;
+        currentTime = 0.0;
+        th = std::thread([this, path, loop]{ this->worker(path, loop); });
+    }
+    
+    void stopAndJoin(){
+        stopFlag = true;
+        if(th.joinable()) th.join();
+    }
+    
+    void togglePause() {
+        isPaused = !isPaused;
+    }
+    
+    bool isPlaying() const {
+        return !isPaused && !stopFlag;
+    }
+    
+    float getProgress() const {
+        if (totalTime <= 0.0) return 0.0f;
+        return static_cast<float>(currentTime / totalTime);
+    }
+
+    std::string getTimeString() const {
+        int currentMinutes = static_cast<int>(currentTime) / 60;
+        int currentSeconds = static_cast<int>(currentTime) % 60;
+        int totalMinutes = static_cast<int>(totalTime) / 60;
+        int totalSeconds = static_cast<int>(totalTime) % 60;
+        
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%02d:%02d / %02d:%02d", 
+                currentMinutes, currentSeconds, totalMinutes, totalSeconds);
+        return std::string(buffer);
+    }
+    
+    void seekTo(float progress) {
+        if (totalTime <= 0.0) return;
+        double targetTime = progress * totalTime;
+        if (targetTime <= totalTime) {
+            seeking = true;
+            currentTime = targetTime;
+            // Find the closest row to this time
+            if (rows.size() > 0) {
+                size_t targetRow = 0;
+                double firstTime = std::stod(rows[0][timeIndex]);
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    double rowTime = std::stod(rows[i][timeIndex]) - firstTime;
+                    if (rowTime >= targetTime) {
+                        targetRow = i;
+                        break;
+                    }
+                }
+                currentRow = targetRow;
+            }
+        }
+    }
+    
+private:
+    void worker(const std::string& path, bool loop){
+        using namespace std::chrono;
+        while(!stopFlag){
+            std::ifstream ifs(path);
+            if(!ifs.is_open()){
+                std::cerr << "CSVPlayer: cannot open " << path << "\n";
+                return;
+            }
+            std::string line;
+            // Skip comment lines
+            while(std::getline(ifs,line)){
+                if(!line.empty() && line[0] != '#'){
+                    break; // first header line reached
+                }
+            }
+            if(ifs.eof()) return;
+            // Build header vector and find indices
+            std::vector<std::string> headers; headers.reserve(32);
+            {
+                std::stringstream ss(line);
+                std::string cell;
+                while(std::getline(ss,cell,',')){
+                    cell.erase(std::remove(cell.begin(),cell.end(),'\"'),cell.end());
+                    headers.push_back(cell);
+                }
+            }
+            auto idxOf=[&](const std::string& key)->int{
+                for(size_t i=0;i<headers.size();++i) if(headers[i]==key) return (int)i;
+                return -1;
+            };
+            timeIndex = idxOf("Time");
+            const int idxLat  = idxOf("Latitude");
+            const int idxLon  = idxOf("Longitude");
+            const int idxHead = idxOf("Heading");
+            if(timeIndex<0||idxLat<0||idxLon<0||idxHead<0){
+                std::cerr << "CSVPlayer: header missing required fields\n";
+                return;
+            }
+            rows.clear();
+            // read rest of file
+            while(std::getline(ifs,line)){
+                if(line.empty()||line[0]=='#') continue;
+                std::vector<std::string> row; row.reserve(headers.size());
+                std::stringstream ss(line);
+                std::string cell;
+                while(std::getline(ss,cell,',')) row.push_back(cell);
+                if(row.size()==headers.size()) rows.push_back(std::move(row));
+            }
+            
+            totalRows = rows.size();
+            currentRow = 0;
+            
+            // Calculate total time
+            if (!rows.empty()) {
+                double firstTime = std::stod(rows[0][timeIndex]);
+                double lastTime = std::stod(rows.back()[timeIndex]);
+                totalTime = lastTime - firstTime;
+                currentTime = 0.0;
+            }
+            
+            // Playback rows
+            double prevSimT = 0.0;
+            bool first = true;
+            for(size_t i = currentRow; i < rows.size(); ++i) {
+                if(stopFlag) return;
+                
+                // Handle pausing
+                while(isPaused && !stopFlag) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if(stopFlag) return;
+                
+                // Handle seeking
+                if (seeking) {
+                    i = currentRow;  // Jump to the new position
+                    first = true;    // Reset first flag to avoid sleep
+                    prevSimT = std::stod(rows[i][timeIndex]);  // Update prevSimT
+                    seeking = false;  // Reset seeking state
+                }
+                
+                auto& r = rows[i];
+                currentRow = i;
+                double simT = std::stod(r[timeIndex]);
+                currentTime = simT - std::stod(rows[0][timeIndex]);
+                
+                if(!first){
+                    double dt = simT - prevSimT;
+                    if(dt>0) std::this_thread::sleep_for(duration<double>(dt));
+                }
+                prevSimT = simT; first=false;
+
+                Pose p; p.lat = std::stod(r[idxLat]); p.lon = std::stod(r[idxLon]);
+                double headingDeg = std::stod(r[idxHead]);
+                p.head = headingDeg * DEG2RAD; // deg→rad
+                p.valid = true;
+                {
+                    std::lock_guard lk(poseMtx);
+                    pose = p; // overwrite global pose
+                }
+            }
+            if(!loop) break;
+            currentRow = 0;  // Reset for next loop
+            currentTime = 0.0;
+        }
+    }
+    std::thread th; 
+    std::atomic_bool stopFlag{false};
+    std::atomic_bool isPaused{false};
+    std::atomic_bool seeking{false};
+    std::atomic<size_t> totalRows{0};
+    std::atomic<size_t> currentRow{0};
+    std::atomic<double> totalTime{0.0};
+    std::atomic<double> currentTime{0.0};
+    std::vector<std::vector<std::string>> rows;
+    int timeIndex = -1;
+};
+CSVPlayer csvPlayer;
 
 // ───────────────────────────────────────────────────────────
 // libwebsockets client thread
@@ -104,7 +363,7 @@ static int wsCallback(lws* wsi, lws_callback_reasons r, void* user,
             std::lock_guard lk(poseMtx);
             pose.lat   = msg.latitude();
             pose.lon   = msg.longitude();
-            pose.head  = msg.heading();           // 0 = north, +CW
+            pose.head  = msg.heading();           // 0 = north, +CW (rad)
             pose.valid = true;
         }
         else
@@ -352,6 +611,7 @@ int main()
     
     // Load settings from INI file
     ImGui::LoadIniSettingsFromDisk("imgui.ini");
+    LoadLightingSettings();  // Load our custom lighting settings
     
     // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(win, true);
@@ -364,7 +624,7 @@ int main()
     // Create texture attachment
     glGenTextures(1, &textureColorbuffer);
     glBindTexture(GL_TEXTURE_2D, textureColorbuffer);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, viewportWidth, viewportHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, viewportWidth, viewportWidth, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureColorbuffer, 0);
@@ -373,7 +633,7 @@ int main()
     GLuint rbo;
     glGenRenderbuffers(1, &rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, viewportWidth, viewportHeight);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, viewportWidth, viewportWidth);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
 
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
@@ -429,6 +689,21 @@ int main()
             mFileDialog.SetTypeFilters({ ".csv" });
             ImGui::Separator();
 
+            // Camera View Selection
+            ImGui::Text("Camera View:");
+            if (ImGui::RadioButton("Follow", !topDownView))
+            {
+                topDownView = false;
+                ImGui::SaveIniSettingsToDisk("imgui.ini");
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Top-Down", topDownView))
+            {
+                topDownView = true;
+                ImGui::SaveIniSettingsToDisk("imgui.ini");
+            }
+            ImGui::Separator();
+
             // Car Color Selection
             ImGui::Text("Car Color:");
             float color[3] = { carColor.r, carColor.g, carColor.b };
@@ -445,28 +720,28 @@ int main()
             if (ImGui::SliderFloat3("Light Direction", lightDir, -1.0f, 1.0f))
             {
                 light.direction = glm::vec3(lightDir[0], lightDir[1], lightDir[2]);
-                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when light direction changes
+                SaveLightingSettings();
             }
             
             float ambient[3] = { light.ambient.r, light.ambient.g, light.ambient.b };
             if (ImGui::ColorEdit3("Ambient Light", ambient))
             {
                 light.ambient = glm::vec3(ambient[0], ambient[1], ambient[2]);
-                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when ambient light changes
+                SaveLightingSettings();
             }
             
             float diffuse[3] = { light.diffuse.r, light.diffuse.g, light.diffuse.b };
             if (ImGui::ColorEdit3("Diffuse Light", diffuse))
             {
                 light.diffuse = glm::vec3(diffuse[0], diffuse[1], diffuse[2]);
-                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when diffuse light changes
+                SaveLightingSettings();
             }
             
             float specular[3] = { light.specular.r, light.specular.g, light.specular.b };
             if (ImGui::ColorEdit3("Specular Light", specular))
             {
                 light.specular = glm::vec3(specular[0], specular[1], specular[2]);
-                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when specular light changes
+                SaveLightingSettings();
             }
             ImGui::Separator();
 
@@ -475,13 +750,24 @@ int main()
             if (ImGui::RadioButton("Manual", manualMode))
             {
                 manualMode = true;
-                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when mode changes
+                replayMode = false;
+                csvPlayer.stopAndJoin();  // Stop any ongoing replay
+                ImGui::SaveIniSettingsToDisk("imgui.ini");
             }
             ImGui::SameLine();
-            if (ImGui::RadioButton("Automatic", !manualMode))
+            if (ImGui::RadioButton("Live", !manualMode && !replayMode))
             {
                 manualMode = false;
-                ImGui::SaveIniSettingsToDisk("imgui.ini");  // Save when mode changes
+                replayMode = false;
+                csvPlayer.stopAndJoin();  // Stop any ongoing replay
+                ImGui::SaveIniSettingsToDisk("imgui.ini");
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Replay", replayMode))
+            {
+                manualMode = false;
+                replayMode = true;
+                ImGui::SaveIniSettingsToDisk("imgui.ini");
             }
 
             ImGui::Separator();
@@ -495,6 +781,13 @@ int main()
             {
                 auto file_path = mFileDialog.GetSelected().string();
                 mCurrentFile = file_path.substr(file_path.find_last_of("/\\") + 1);
+                mSelectedCsvPath = file_path;
+                csvFileSelected = true;
+                // Only start CSV playback if in replay mode
+                if (replayMode) {
+                    csvPlayer.play(file_path, true); // loop playback
+                }
+                mFileDialog.ClearSelected();
             }
         }
 
@@ -609,22 +902,40 @@ int main()
             ImGui::End();
         }
 
+        // Progress Bar window
+        if (replayMode) {
+            ImGui::Begin("Playback Controls", nullptr, ImGuiWindowFlags_NoCollapse);
+            
+            // Play/Pause button
+            if (ImGui::Button(csvPlayer.isPlaying() ? "Pause" : "Play")) {
+                csvPlayer.togglePause();
+            }
+            ImGui::SameLine();
+            
+            // Progress bar with dragging
+            float progress = csvPlayer.getProgress();
+            if (ImGui::SliderFloat("##Progress", &progress, 0.0f, 1.0f, csvPlayer.getTimeString().c_str())) {
+                csvPlayer.seekTo(progress);
+            }
+            
+            ImGui::End();
+        }
+
         ImGui::End(); // End the dock space window
 
-        /* update from WS */
+        /* update from pose (WS or CSV) */
         {
             std::lock_guard lk(poseMtx);
-            if(pose.valid && !manualMode){
+            if(pose.valid && (!manualMode || replayMode)){  // Allow updates in both live and replay modes
                 glm::dvec2 enu=llToENU(pose.lat,pose.lon);
                 // Scale the ENU coordinates to match grid (0.025 units = 1 meter)
                 modelPos.x = (float)(enu.x * 0.025);
                 modelPos.z = (float)(-enu.y * 0.025);  // north→ -Z
                 modelYaw   = 180.f - (float)(pose.head*180/M_PI);
                 
-                glm::vec3 cameraOffset = glm::vec3( 0, 0.1f, 0.3f);
-                cameraPos = cameraOffset + modelPos;
-                
-                std::cout << "E=" << std::fixed << std::setw(8) << std::setprecision(2) << enu.x << " m   N=" << std::setw(8) << enu.y << " m   θ=" << std::setw(8) << pose.head << " rad" << std::endl;
+                if (!cameraLocked) {
+                    updateCamera();
+                }
             }
         }
         processInput(win, manualMode);
@@ -669,6 +980,7 @@ int main()
     delete car;
 
     stopWS=true;
+    csvPlayer.stopAndJoin();
     glfwTerminate();
     std::cout << "Application terminated" << std::endl;
     return 0;
@@ -695,16 +1007,36 @@ void processInput(GLFWwindow* window, bool manual)
     float speed = 0.2f * deltaTime;  // 0.2 m/s (0.2 * 0.025)
     const float yawRad = glm::radians(modelYaw);     // Y-axis yaw (degrees → rad)
     glm::vec3 carForward = glm::vec3(sin(yawRad), 0.0f, cos(yawRad));
-    if (glfwGetKey(window,GLFW_KEY_W)==GLFW_PRESS){ cameraPos += speed*carForward; modelPos += speed*carForward; }
-    if (glfwGetKey(window,GLFW_KEY_S)==GLFW_PRESS){ cameraPos -= speed*carForward; modelPos -= speed*carForward; }
-    if (glfwGetKey(window,GLFW_KEY_A)==GLFW_PRESS){ modelYaw += 90.0f*deltaTime; }
-    if (glfwGetKey(window,GLFW_KEY_D)==GLFW_PRESS){ modelYaw -= 90.0f*deltaTime; }
+    if (glfwGetKey(window,GLFW_KEY_W)==GLFW_PRESS){ 
+        modelPos += speed*carForward; 
+        if (!cameraLocked) {
+            updateCamera();
+        }
+    }
+    if (glfwGetKey(window,GLFW_KEY_S)==GLFW_PRESS){ 
+        modelPos -= speed*carForward; 
+        if (!cameraLocked) {
+            updateCamera();
+        }
+    }
+    if (glfwGetKey(window,GLFW_KEY_A)==GLFW_PRESS){ 
+        modelYaw += 90.0f*deltaTime; 
+        if (!cameraLocked) {
+            updateCamera();
+        }
+    }
+    if (glfwGetKey(window,GLFW_KEY_D)==GLFW_PRESS){ 
+        modelYaw -= 90.0f*deltaTime; 
+        if (!cameraLocked) {
+            updateCamera();
+        }
+    }
 }
 void framebuffer_size_callback(GLFWwindow*,int w,int h){ glViewport(0,0,w,h); }
 
 void mouse_callback(GLFWwindow*,double xpos,double ypos)
 {
-    if(cameraLocked) return;  // Skip mouse input if camera is locked
+    if(cameraLocked || topDownView) return;  // Skip mouse input if camera is locked or in top-down view
     
     if(firstMouse){ lastX=(float)xpos; lastY=(float)ypos; firstMouse=false; }
     float xoff=(float)xpos-lastX, yoff=lastY-(float)ypos; lastX=(float)xpos; lastY=(float)ypos;
