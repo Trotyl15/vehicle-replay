@@ -49,7 +49,7 @@ std::string mSelectedCsvPath;
 
 // Track visualization
 std::deque<glm::vec3> trackPoints;
-const size_t MAX_TRACK_POINTS = 1000;  // Maximum number of points to store
+const size_t MAX_TRACK_POINTS = 10000;  // Maximum number of points to store
 GLuint trackVAO, trackVBO;
 // UI state
 bool showSettings = true;
@@ -69,6 +69,8 @@ glm::vec3 topDownOffset(0.0f, 5.0f, 0.0f);  // Camera offset for top-down view
 glm::vec3 followOffset(0.0f, 0.1f, 0.3f);   // Camera offset for follow view
 glm::vec3 lockedCameraFront{0.0f, 0.0f, -1.0f};  // Store the camera orientation when locked
 bool wasLocked = false;  // Track if camera was previously locked
+bool isDragging = false;  // Track if we're currently dragging
+glm::vec2 lastDragPos;   // Last mouse position during drag
 
 // Function to update camera position and orientation
 void updateCamera() {
@@ -190,6 +192,19 @@ public:
     CSVPlayer() : stopFlag(false), isPaused(false), seeking(false), totalRows(0), currentRow(0), totalTime(0.0), currentTime(0.0) {}
     ~CSVPlayer(){ stopAndJoin(); }
 
+    // Add new method to get current row data
+    std::vector<std::string> getCurrentRowData() const {
+        if (currentRow < rows.size()) {
+            return rows[currentRow];
+        }
+        return std::vector<std::string>();
+    }
+
+    // Add method to get header names
+    std::vector<std::string> getHeaders() const {
+        return headers;
+    }
+
     void play(const std::string& path, bool loop=true) {
         stopAndJoin();
         stopFlag = false;
@@ -272,7 +287,7 @@ private:
             }
             if(ifs.eof()) return;
             // Build header vector and find indices
-            std::vector<std::string> headers; headers.reserve(32);
+            headers.clear(); headers.reserve(32);  // Make headers accessible
             {
                 std::stringstream ss(line);
                 std::string cell;
@@ -370,6 +385,7 @@ private:
     std::atomic<double> currentTime{0.0};
     std::vector<std::vector<std::string>> rows;
     int timeIndex = -1;
+    std::vector<std::string> headers;  // Add headers as member variable
 };
 CSVPlayer csvPlayer;
 
@@ -945,6 +961,40 @@ int main()
             ImGui::End();
         }
 
+        // Data View window
+        if (replayMode) {
+            ImGui::Begin("Data View", nullptr, ImGuiWindowFlags_NoCollapse);
+            
+            auto currentData = csvPlayer.getCurrentRowData();
+            auto headers = csvPlayer.getHeaders();
+            
+            if (!currentData.empty() && !headers.empty()) {
+                // Create a table to display the data
+                if (ImGui::BeginTable("DataTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Property");
+                    ImGui::TableSetupColumn("Value");
+                    ImGui::TableHeadersRow();
+
+                    for (size_t i = 0; i < headers.size() && i < currentData.size(); ++i) {
+                        ImGui::TableNextRow();
+                        
+                        // Property column
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", headers[i].c_str());
+                        
+                        // Value column
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", currentData[i].c_str());
+                    }
+                    ImGui::EndTable();
+                }
+            } else {
+                ImGui::Text("No data available");
+            }
+            
+            ImGui::End();
+        }
+
         ImGui::End(); // End the dock space window
 
         /* update from pose (WS or CSV) */
@@ -1051,10 +1101,36 @@ void processInput(GLFWwindow* window, bool manual)
 }
 void framebuffer_size_callback(GLFWwindow*,int w,int h){ glViewport(0,0,w,h); }
 
-void mouse_callback(GLFWwindow*,double xpos,double ypos)
+void mouse_callback(GLFWwindow* window, double xpos, double ypos)
 {
-    if(cameraLocked || topDownView) return;  // Skip mouse input if camera is locked or in top-down view
+    if(cameraLocked) return;  // Skip mouse input if camera is locked
     
+    if(topDownView) {
+        // Handle dragging in top-down view
+        if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+            if(!isDragging) {
+                isDragging = true;
+                lastDragPos = glm::vec2(xpos, ypos);
+            } else {
+                // Calculate drag delta and update camera position
+                glm::vec2 currentPos(xpos, ypos);
+                glm::vec2 delta = currentPos - lastDragPos;
+                
+                // Convert screen delta to world space movement
+                // Scale factor to control drag sensitivity
+                const float dragSensitivity = 0.01f;
+                cameraPos.x -= delta.x * dragSensitivity;
+                cameraPos.z -= delta.y * dragSensitivity;  // Changed from += to -= to match mouse movement
+                
+                lastDragPos = currentPos;
+            }
+        } else {
+            isDragging = false;
+        }
+        return;
+    }
+    
+    // Original mouse look behavior for non-top-down view
     if(firstMouse){ lastX=(float)xpos; lastY=(float)ypos; firstMouse=false; }
     float xoff=(float)xpos-lastX, yoff=lastY-(float)ypos; lastX=(float)xpos; lastY=(float)ypos;
     const float sens=0.05f; xoff*=sens; yoff*=sens;
@@ -1068,7 +1144,7 @@ void mouse_callback(GLFWwindow*,double xpos,double ypos)
 
 void scroll_callback(GLFWwindow*,double,double yoff)
 {
-    if(fov>=1.0f && fov<=45.0f) fov -= (float)yoff;
+    if(fov>=1.0f && fov<=90.0f) fov -= (float)yoff;
     if(fov<1.0f)  fov = 1.0f;
-    if(fov>45.0f) fov = 45.0f;
+    if(fov>90.0f) fov = 90.0f;
 }
