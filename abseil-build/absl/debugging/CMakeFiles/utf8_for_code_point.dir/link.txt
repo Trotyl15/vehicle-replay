@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libabsl_utf8_for_code_point.so.0 -o libabsl_utf8_for_code_point.so.0 CMakeFiles/utf8_for_code_point.dir/internal/utf8_for_code_point.cc.o  -Wl,-rpath,::::::: 

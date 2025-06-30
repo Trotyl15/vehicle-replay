@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libabsl_log_internal_nullguard.so.0 -o libabsl_log_internal_nullguard.so.0 CMakeFiles/log_internal_nullguard.dir/internal/nullguard.cc.o  -Wl,-rpath,::::::: 

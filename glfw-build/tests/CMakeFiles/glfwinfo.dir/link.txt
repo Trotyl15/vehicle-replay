@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/glfwinfo.dir/glfwinfo.c.o CMakeFiles/glfwinfo.dir/__/deps/getopt.c.o -o glfwinfo  -Wl,-rpath,/home/amyhu/Documents/vehicle-replay/glfw-build/src ../src/libglfw.so.3.5 -lm 

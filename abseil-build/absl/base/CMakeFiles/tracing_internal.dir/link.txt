@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libabsl_tracing_internal.so.0 -o libabsl_tracing_internal.so.0 CMakeFiles/tracing_internal.dir/internal/tracing.cc.o  -Wl,-rpath,"\$ORIGIN:" libabsl_base.so.0 libabsl_raw_logging_internal.so.0 libabsl_log_severity.so.0 libabsl_spinlock_wait.so.0 

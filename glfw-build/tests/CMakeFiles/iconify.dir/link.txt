@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/iconify.dir/iconify.c.o CMakeFiles/iconify.dir/__/deps/getopt.c.o -o iconify  -Wl,-rpath,/home/amyhu/Documents/vehicle-replay/glfw-build/src ../src/libglfw.so.3.5 -lm 

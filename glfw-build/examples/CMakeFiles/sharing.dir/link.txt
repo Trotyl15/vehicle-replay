@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/sharing.dir/sharing.c.o -o sharing  -Wl,-rpath,/home/amyhu/Documents/vehicle-replay/glfw-build/src ../src/libglfw.so.3.5 -lm 

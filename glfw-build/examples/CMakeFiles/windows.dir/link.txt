@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/windows.dir/windows.c.o -o windows  -Wl,-rpath,/home/amyhu/Documents/vehicle-replay/glfw-build/src ../src/libglfw.so.3.5 -lm 
