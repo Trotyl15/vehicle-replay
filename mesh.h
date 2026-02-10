@@ -99,6 +99,7 @@ public:
         shader.setVec4("material.baseColor", material.baseColor);
         shader.setFloat("material.metallic", material.metallic);
         shader.setFloat("material.roughness", material.roughness);
+        shader.setBool("hasDiffuseTexture", diffuseNr > 1);
 
         // Draw mesh
         glBindVertexArray(VAO);

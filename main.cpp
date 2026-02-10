@@ -34,13 +34,18 @@
 #include "imgui_impl_opengl3.h"
 #include "imfilebrowser.h"
 
+#include "map_tiles.h"
+
 // ───────────────────────────────────────────────────────────
 // window / camera globals
 // ───────────────────────────────────────────────────────────
 const unsigned SCR_WIDTH = 1200, SCR_HEIGHT = 800;
 glm::vec3 cameraPos{0,2.1f,3}, cameraFront{0,-0.05,-1}, cameraUp{0,1,0};
 glm::vec3 modelPos{0,2,2.7f};
-float modelYaw = 180.0f, deltaTime = 0, lastFrame = 0, fov = 45;
+glm::vec3 targetModelPos{0,2,2.7f};   // interpolation target
+float modelYaw = 180.0f, targetModelYaw = 180.0f;
+float deltaTime = 0, lastFrame = 0, fov = 45;
+const float LERP_SPEED = 10.0f;  // interpolation speed
 float lastX=400,lastY=300, yaw=-90,pitch=0; bool firstMouse=true;
 Assimp::Importer importer;
 ImGui::FileBrowser mFileDialog;
@@ -71,6 +76,19 @@ glm::vec3 lockedCameraFront{0.0f, 0.0f, -1.0f};  // Store the camera orientation
 bool wasLocked = false;  // Track if camera was previously locked
 bool isDragging = false;  // Track if we're currently dragging
 glm::vec2 lastDragPos;   // Last mouse position during drag
+
+// Map tile manager
+MapTileManager mapTiles;
+GLuint mapTileVAO = 0, mapTileVBO = 0;
+Shader* mapTileShader = nullptr;
+double currentLat = 0.0, currentLon = 0.0;  // current GPS for UI display
+
+// Traffic cone placement
+Model* coneModel = nullptr;
+std::vector<glm::vec3> conePlacements;  // world-space positions of placed cones
+bool showConeContextMenu = false;
+glm::vec3 pendingConePos(0.0f);         // world pos under the right-click
+ImVec2 viewportOrigin(0,0);             // screen pos of the 3D viewport origin
 
 // Function to update camera position and orientation
 void updateCamera() {
@@ -164,17 +182,25 @@ void LoadLightingSettings() {
 // ───────────────────────────────────────────────────────────
 // geo-math constants
 // ───────────────────────────────────────────────────────────
-constexpr double LAT0 = 37.7955, LON0 = -122.3937;
+double LAT0 = 37.7955, LON0 = -122.3937;
+bool   originSet = false;          // true once LAT0/LON0 have been set from data
 constexpr double EARTH_R = 6'378'137.0;
 constexpr double DEG2RAD = M_PI/180.0;
-constexpr double LAT0_RAD = LAT0*DEG2RAD;
 
 inline glm::dvec2 llToENU(double lat, double lon)
 {
+    // Auto-set origin to the first valid coordinate we receive
+    if (!originSet && lat != 0.0 && lon != 0.0) {
+        LAT0 = lat;
+        LON0 = lon;
+        originSet = true;
+        mapTiles.setReference(lat, lon);
+    }
+    double lat0Rad = LAT0 * DEG2RAD;
     double dLat = (lat - LAT0)*DEG2RAD;
     double dLon = (lon - LON0)*DEG2RAD;
     double north = EARTH_R * dLat;
-    double east  = EARTH_R * dLon * cos(LAT0_RAD);
+    double east  = EARTH_R * dLon * cos(lat0Rad);
     return { east, north };
 }
 
@@ -229,6 +255,9 @@ public:
     bool isPlaying() const {
         return !isPaused && !stopFlag;
     }
+
+    std::atomic<float> playbackSpeed{1.0f};  // default 1x speed
+    std::atomic_bool snapRequested{false};
     
     float getProgress() const {
         if (totalTime <= 0.0) return 0.0f;
@@ -259,6 +288,7 @@ public:
                 double firstTime = std::stod(rows[0][timeIndex]);
                 for (size_t i = 0; i < rows.size(); ++i) {
                     double rowTime = std::stod(rows[i][timeIndex]) - firstTime;
+                    if (timeInUs) rowTime /= 1e6;
                     if (rowTime >= targetTime) {
                         targetRow = i;
                         break;
@@ -301,13 +331,25 @@ private:
                 return -1;
             };
             timeIndex = idxOf("Time");
-            const int idxLat  = idxOf("Latitude");
-            const int idxLon  = idxOf("Longitude");
-            const int idxHead = idxOf("Heading");
+            if (timeIndex < 0) timeIndex = idxOf("timestamp_us");
+            bool timeInMicroseconds = (timeIndex >= 0 && headers[timeIndex] == "timestamp_us");
+            timeInUs = timeInMicroseconds;
+
+            int idxLat  = idxOf("Latitude");
+            if (idxLat < 0) idxLat = idxOf("lat_synth");
+            int idxLon  = idxOf("Longitude");
+            if (idxLon < 0) idxLon = idxOf("lon_synth");
+            int idxHead = idxOf("Heading");
+            if (idxHead < 0) idxHead = idxOf("ground_track_deg");
+            if (idxHead < 0) idxHead = idxOf("vehicle_heading_deg");
+
             if(timeIndex<0||idxLat<0||idxLon<0||idxHead<0){
-                std::cerr << "CSVPlayer: header missing required fields\n";
+                std::cerr << "CSVPlayer: header missing required fields (need Time/timestamp_us, Latitude/lat_synth, Longitude/lon_synth, Heading/vehicle_heading_deg)\n";
                 return;
             }
+            // Reset the origin so it recalculates from this dataset
+            originSet = false;
+            lastGpsLat = 0; lastGpsLon = 0; hasLastGps = false;
             rows.clear();
             // read rest of file
             while(std::getline(ifs,line)){
@@ -326,7 +368,8 @@ private:
             if (!rows.empty()) {
                 double firstTime = std::stod(rows[0][timeIndex]);
                 double lastTime = std::stod(rows.back()[timeIndex]);
-                totalTime = lastTime - firstTime;
+                double rawTotal = lastTime - firstTime;
+                totalTime = timeInMicroseconds ? rawTotal / 1e6 : rawTotal;
                 currentTime = 0.0;
             }
             
@@ -347,23 +390,65 @@ private:
                     i = currentRow;  // Jump to the new position
                     first = true;    // Reset first flag to avoid sleep
                     prevSimT = std::stod(rows[i][timeIndex]);  // Update prevSimT
+                    // Seed previous GPS from the row before the seek target
+                    // so heading is computed correctly from the start
+                    hasLastGps = false;
+                    for (size_t back = i; back > 0; --back) {
+                        double bLat = std::stod(rows[back-1][idxLat]);
+                        double bLon = std::stod(rows[back-1][idxLon]);
+                        if (bLat != 0.0 || bLon != 0.0) {
+                            lastGpsLat = bLat; lastGpsLon = bLon;
+                            hasLastGps = true;
+                            break;
+                        }
+                    }
+                    snapRequested = true;
                     seeking = false;  // Reset seeking state
                 }
                 
                 auto& r = rows[i];
                 currentRow = i;
                 double simT = std::stod(r[timeIndex]);
-                currentTime = simT - std::stod(rows[0][timeIndex]);
+                double rawElapsed = simT - std::stod(rows[0][timeIndex]);
+                currentTime = timeInMicroseconds ? rawElapsed / 1e6 : rawElapsed;
                 
                 if(!first){
                     double dt = simT - prevSimT;
+                    if (timeInMicroseconds) dt /= 1e6;
+                    float spd = playbackSpeed.load();
+                    if (spd > 0.0f) dt /= spd;
                     if(dt>0) std::this_thread::sleep_for(duration<double>(dt));
                 }
                 prevSimT = simT; first=false;
 
-                Pose p; p.lat = std::stod(r[idxLat]); p.lon = std::stod(r[idxLon]);
-                double headingDeg = std::stod(r[idxHead]);
-                p.head = headingDeg * DEG2RAD; // deg→rad
+                double lat = std::stod(r[idxLat]);
+                double lon = std::stod(r[idxLon]);
+                // Skip rows with invalid (zero) GPS coordinates
+                if (lat == 0.0 && lon == 0.0) continue;
+
+                Pose p; p.lat = lat; p.lon = lon;
+
+                // Compute heading from consecutive GPS positions
+                // This is more reliable than the heading column which may be an IMU heading
+                if (hasLastGps) {
+                    double dLat = lat - lastGpsLat;
+                    double dLon = lon - lastGpsLon;
+                    double dist = sqrt(dLat*dLat + dLon*dLon);
+                    if (dist > 1e-8) {  // only update heading if there's meaningful movement
+                        // atan2(dEast, dNorth) gives compass bearing in radians
+                        double bearing = atan2(dLon * cos(lat * DEG2RAD), dLat);
+                        p.head = bearing;  // already in radians, 0=North, +CW
+                    } else {
+                        // Not enough movement, use column value as fallback
+                        double headingVal = std::stod(r[idxHead]);
+                        p.head = headingVal * DEG2RAD;
+                    }
+                } else {
+                    double headingVal = std::stod(r[idxHead]);
+                    p.head = headingVal * DEG2RAD;
+                }
+                lastGpsLat = lat; lastGpsLon = lon; hasLastGps = true;
+
                 p.valid = true;
                 {
                     std::lock_guard lk(poseMtx);
@@ -385,6 +470,9 @@ private:
     std::atomic<double> currentTime{0.0};
     std::vector<std::vector<std::string>> rows;
     int timeIndex = -1;
+    bool timeInUs = false;             // true when column is timestamp_us
+    double lastGpsLat = 0, lastGpsLon = 0;
+    bool hasLastGps = false;
     std::vector<std::string> headers;  // Add headers as member variable
 };
 CSVPlayer csvPlayer;
@@ -498,8 +586,11 @@ int main()
         "res/shaders/model.fs",
         "res/shaders/track.vs",
         "res/shaders/track.fs",
+        "res/shaders/map_tile.vs",
+        "res/shaders/map_tile.fs",
         "res/models/car2/scene.gltf",
-        "res/models/car3/model.obj"
+        "res/models/car3/model.obj",
+        "res/cone/1.obj"
     };
 
     std::cout << "Checking required files..." << std::endl;
@@ -596,6 +687,14 @@ int main()
             return -1;
         }
         std::cout << "Track shader loaded successfully" << std::endl;
+
+        std::cout << "Loading map tile shader..." << std::endl;
+        mapTileShader = new Shader("res/shaders/map_tile.vs","res/shaders/map_tile.fs");
+        if (mapTileShader->ID == 0) {
+            std::cerr << "Failed to load map tile shader\n";
+            return -1;
+        }
+        std::cout << "Map tile shader loaded successfully" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Error loading shaders: " << e.what() << std::endl;
         return -1;
@@ -608,6 +707,15 @@ int main()
         std::cout << "Car model loaded" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Error loading car model: " << e.what() << std::endl;
+        return -1;
+    }
+
+    std::cout << "Loading cone model..." << std::endl;
+    try {
+        coneModel = new Model("res/cone/1.obj");
+        std::cout << "Cone model loaded" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading cone model: " << e.what() << std::endl;
         return -1;
     }
 
@@ -635,6 +743,22 @@ int main()
     } catch (const std::exception& e) {
         std::cerr << "Error initializing track visualization: " << e.what() << std::endl;
         return -1;
+    }
+
+    // Initialize map tile quad (two triangles with positions + UVs)
+    {
+        glGenVertexArrays(1, &mapTileVAO);
+        glGenBuffers(1, &mapTileVBO);
+        glBindVertexArray(mapTileVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, mapTileVBO);
+        // 6 vertices × 5 floats (x,y,z, u,v) – will be filled per-tile
+        glBufferData(GL_ARRAY_BUFFER, 6 * 5 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5*sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5*sizeof(float), (void*)(3*sizeof(float)));
+        glBindVertexArray(0);
+        std::cout << "Map tile quad initialized" << std::endl;
     }
 
     std::cout << "Starting WebSocket thread..." << std::endl;
@@ -815,6 +939,22 @@ int main()
             // Camera Lock Status
             ImGui::Text("Camera: %s", cameraLocked ? "Locked (Press 'L' to unlock)" : "Free (Press 'L' to lock)");
 
+            ImGui::Separator();
+
+            // Map Controls
+            ImGui::Text("Map Settings:");
+            ImGui::Checkbox("Show Map", &mapTiles.enabled);
+            if (mapTiles.enabled) {
+                ImGui::SliderInt("Zoom Level", &mapTiles.zoomLevel, 15, 20);
+            }
+
+            ImGui::Separator();
+
+            // Lat/Lon display
+            ImGui::Text("GPS Position:");
+            ImGui::Text("Lat:  %.8f", currentLat);
+            ImGui::Text("Lon: %.8f", currentLon);
+
             ImGui::End();
             mFileDialog.Display();
             if (mFileDialog.HasSelected())
@@ -860,7 +1000,52 @@ int main()
             glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
             glm::mat4 proj = glm::perspective(glm::radians(fov), (float)viewportWidth/(float)viewportHeight, 0.1f, 100.0f);
 
-            // Render track
+            // Render map tiles (before grid so grid can overlay)
+            if (mapTiles.enabled && mapTileShader) {
+                mapTiles.clearRenderList();
+                glm::mat4 vp = proj * view;
+                mapTiles.render(vp, mapTileVAO);
+
+                mapTileShader->use();
+                mapTileShader->setInt("uTileTex", 0);
+                glActiveTexture(GL_TEXTURE0);
+                glBindVertexArray(mapTileVAO);
+
+                const float tileY = 2.0f;  // same Y as car base and grid plane
+
+                for (auto& tile : mapTiles.tileRenderList) {
+                    // Build a quad: NW corner = (x0, tileY, z0), SE corner = (x1, tileY, z1)
+                    float verts[] = {
+                        // pos(x,y,z), uv(u,v)
+                        tile.x0, tileY, tile.z0,  0.0f, 0.0f,  // NW  (top-left in UV)
+                        tile.x1, tileY, tile.z0,  1.0f, 0.0f,  // NE
+                        tile.x1, tileY, tile.z1,  1.0f, 1.0f,  // SE
+                        tile.x0, tileY, tile.z0,  0.0f, 0.0f,  // NW
+                        tile.x1, tileY, tile.z1,  1.0f, 1.0f,  // SE
+                        tile.x0, tileY, tile.z1,  0.0f, 1.0f,  // SW
+                    };
+
+                    mapTileShader->setMat4("uVP", vp);
+                    glBindTexture(GL_TEXTURE_2D, tile.tex);
+                    glBindBuffer(GL_ARRAY_BUFFER, mapTileVBO);
+                    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                }
+                glBindVertexArray(0);
+            }
+
+            // Render grid (only when map tiles are disabled)
+            glm::mat4 model = glm::mat4(1.0f);
+            if (!mapTiles.enabled) {
+                gridShader->use();
+                glm::mat4 gVP = proj * view * model;
+                glUniformMatrix4fv(glGetUniformLocation(gridShader->ID,"gVP"),1,GL_FALSE,glm::value_ptr(gVP));
+                glUniform3fv(glGetUniformLocation(gridShader->ID,"gCameraWorldPos"),1,glm::value_ptr(cameraPos));
+                glBindVertexArray(VAO);
+                glDrawArrays(GL_TRIANGLES,0,6);
+            }
+
+            // Render track lines (on top of map tiles)
             if (!trackPoints.empty()) {
                 trackShader->use();
                 trackShader->setMat4("projection", proj);
@@ -875,7 +1060,7 @@ int main()
                 std::vector<glm::vec3> quadVertices;
                 const float trackWidth = 0.03f;
                 const float overlap = 0.005f;
-                const float heightOffset = -0.001f;
+                const float heightOffset = 0.001f;  // slightly above tiles
                 
                 for (size_t i = 0; i < points.size() - 1; ++i) {
                     glm::vec3 current = points[i];
@@ -901,15 +1086,6 @@ int main()
                 glBindVertexArray(0);
             }
 
-            // Render grid
-            gridShader->use();
-            glm::mat4 model = glm::mat4(1.0f);
-            glm::mat4 gVP = proj * view * model;
-            glUniformMatrix4fv(glGetUniformLocation(gridShader->ID,"gVP"),1,GL_FALSE,glm::value_ptr(gVP));
-            glUniform3fv(glGetUniformLocation(gridShader->ID,"gCameraWorldPos"),1,glm::value_ptr(cameraPos));
-            glBindVertexArray(VAO);
-            glDrawArrays(GL_TRIANGLES,0,6);
-
             // Render car model
             modelShader->use();
             modelShader->setMat4("projection", proj);
@@ -930,14 +1106,78 @@ int main()
             modelShader->setMat4("model", model);
             car->Draw(*modelShader);
 
+            // Render placed traffic cones
+            if (coneModel) {
+                // Reuse model shader with an orange color for cones
+                glm::vec3 coneColor(1.0f, 0.35f, 0.0f);  // safety orange
+                modelShader->setVec3("carColor", coneColor);
+                for (auto& cpos : conePlacements) {
+                    model = glm::mat4(1.0f);
+                    model = glm::translate(model, cpos);
+                    model = glm::scale(model, glm::vec3(0.003f));  // OBJ is in cm, scale down
+                    modelShader->setMat4("model", model);
+                    coneModel->Draw(*modelShader);
+                }
+            }
+
             // Reset framebuffer
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
             // Display the rendered texture in ImGui with flipped UV coordinates
+            // Record viewport position for mouse mapping
+            viewportOrigin = ImGui::GetCursorScreenPos();
             ImGui::Image((ImTextureID)(uintptr_t)textureColorbuffer, 
                         ImVec2(viewportWidth, viewportHeight),
                         ImVec2(0, 1),  // UV0: bottom-left
                         ImVec2(1, 0)); // UV1: top-right
+
+            // ── Right-click to place cone ──
+            if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                // Get mouse pos relative to the viewport image
+                ImVec2 mouseScreen = ImGui::GetMousePos();
+                float mx = mouseScreen.x - viewportOrigin.x;
+                float my = mouseScreen.y - viewportOrigin.y;
+
+                // Normalised device coords (-1 to 1)
+                float ndcX =  (2.0f * mx / viewportWidth)  - 1.0f;
+                float ndcY = -(2.0f * my / viewportHeight) + 1.0f; // flip Y
+
+                // Unproject ray from camera through click point
+                glm::mat4 invVP = glm::inverse(proj * view);
+                glm::vec4 nearPt = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
+                glm::vec4 farPt  = invVP * glm::vec4(ndcX, ndcY,  1.0f, 1.0f);
+                nearPt /= nearPt.w;
+                farPt  /= farPt.w;
+
+                glm::vec3 rayOrigin(nearPt);
+                glm::vec3 rayDir = glm::normalize(glm::vec3(farPt) - glm::vec3(nearPt));
+
+                // Intersect with ground plane  Y = 2.0  (the grid / tile plane)
+                const float groundY = 2.0f;
+                if (std::abs(rayDir.y) > 1e-6f) {
+                    float t = (groundY - rayOrigin.y) / rayDir.y;
+                    if (t > 0.0f) {
+                        pendingConePos = rayOrigin + t * rayDir;
+                        pendingConePos.y = groundY;
+                        showConeContextMenu = true;
+                        ImGui::OpenPopup("ConeContextMenu");
+                    }
+                }
+            }
+
+            // Context menu popup
+            if (ImGui::BeginPopup("ConeContextMenu")) {
+                if (ImGui::MenuItem("Place Traffic Cone")) {
+                    conePlacements.push_back(pendingConePos);
+                }
+                if (!conePlacements.empty() && ImGui::MenuItem("Remove Last Cone")) {
+                    conePlacements.pop_back();
+                }
+                if (!conePlacements.empty() && ImGui::MenuItem("Clear All Cones")) {
+                    conePlacements.clear();
+                }
+                ImGui::EndPopup();
+            }
 
             ImGui::End();
         }
@@ -957,7 +1197,21 @@ int main()
             if (ImGui::SliderFloat("##Progress", &progress, 0.0f, 1.0f, csvPlayer.getTimeString().c_str())) {
                 csvPlayer.seekTo(progress);
             }
-            
+
+            // Playback speed control
+            const char* speedLabels[] = { "1x", "2x", "4x", "8x", "16x" };
+            const float speedValues[] = { 1.0f, 2.0f, 4.0f, 8.0f, 16.0f };
+            float curSpeed = csvPlayer.playbackSpeed.load();
+            int speedIdx = 0;
+            for (int s = 0; s < 5; ++s) {
+                if (std::abs(curSpeed - speedValues[s]) < 0.01f) { speedIdx = s; break; }
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(60);
+            if (ImGui::Combo("Speed", &speedIdx, speedLabels, 5)) {
+                csvPlayer.playbackSpeed = speedValues[speedIdx];
+            }
+
             ImGui::End();
         }
 
@@ -991,6 +1245,44 @@ int main()
             } else {
                 ImGui::Text("No data available");
             }
+
+            // Cone list
+            if (!conePlacements.empty()) {
+                ImGui::Separator();
+                ImGui::Text("Traffic Cones (%zu):", conePlacements.size());
+                if (ImGui::BeginTable("ConeTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                    ImGui::TableSetupColumn("Latitude");
+                    ImGui::TableSetupColumn("Longitude");
+                    ImGui::TableHeadersRow();
+
+                    double lat0Rad = LAT0 * DEG2RAD;
+                    int removeIdx = -1;
+                    for (size_t i = 0; i < conePlacements.size(); ++i) {
+                        auto& cp = conePlacements[i];
+                        // Reverse ENU: world x = east*0.025, world z = -north*0.025
+                        double east  = cp.x / 0.025;
+                        double north = -cp.z / 0.025;
+                        double lat = LAT0 + north / EARTH_R / DEG2RAD;
+                        double lon = LON0 + east / (EARTH_R * cos(lat0Rad)) / DEG2RAD;
+
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%zu", i + 1);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.8f", lat);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%.8f", lon);
+
+                        // Right-click row to remove
+                        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+                            removeIdx = (int)i;
+                    }
+                    ImGui::EndTable();
+                    if (removeIdx >= 0)
+                        conePlacements.erase(conePlacements.begin() + removeIdx);
+                }
+            }
             
             ImGui::End();
         }
@@ -1001,17 +1293,44 @@ int main()
         {
             std::lock_guard lk(poseMtx);
             if(pose.valid && (!manualMode || replayMode)){  // Allow updates in both live and replay modes
+                currentLat = pose.lat;
+                currentLon = pose.lon;
                 glm::dvec2 enu=llToENU(pose.lat,pose.lon);
                 // Scale the ENU coordinates to match grid (0.025 units = 1 meter)
-                modelPos.x = (float)(enu.x * 0.025);
-                modelPos.z = (float)(-enu.y * 0.025);  // north→ -Z
-                modelYaw   = 180.f - (float)(pose.head*180/M_PI);
-                
-                // Always update camera in replay mode, or when unlocked in live mode
-                if (replayMode || !cameraLocked) {
-                    updateCamera();
-                }
+                targetModelPos.x = (float)(enu.x * 0.025);
+                targetModelPos.z = (float)(-enu.y * 0.025);  // north→ -Z
+                targetModelPos.y = modelPos.y;  // keep Y unchanged
+                // Compass heading: 0°=North(−Z), 90°=East(+X), CW positive
+                // Model natively faces +Z; at modelYaw=180° it faces −Z (North)
+                // So modelYaw = 180 − headingDeg maps compass to model correctly
+                float headingDeg = (float)(pose.head * 180.0 / M_PI);
+                targetModelYaw = 180.0f - headingDeg;
+
+                // Update map tiles around current position
+                mapTiles.update(pose.lat, pose.lon);
             }
+        }
+
+        /* smooth interpolation for position and yaw */
+        if (!manualMode || replayMode) {
+            float t = glm::clamp(LERP_SPEED * deltaTime, 0.0f, 1.0f);
+            // Snap instantly when user seeks
+            if (csvPlayer.snapRequested.exchange(false)) {
+                modelPos = targetModelPos;
+                modelYaw = targetModelYaw;
+                trackPoints.clear();
+            } else {
+                modelPos = glm::mix(modelPos, targetModelPos, t);
+
+                // Shortest-path yaw interpolation
+                float yawDiff = targetModelYaw - modelYaw;
+                // Wrap to [-180, 180]
+                while (yawDiff >  180.0f) yawDiff -= 360.0f;
+                while (yawDiff < -180.0f) yawDiff += 360.0f;
+                modelYaw += yawDiff * t;
+            }
+
+            updateCamera();
         }
         processInput(win, manualMode);
 
@@ -1052,7 +1371,9 @@ int main()
     delete gridShader;
     delete modelShader;
     delete trackShader;
+    delete mapTileShader;
     delete car;
+    delete coneModel;
 
     stopWS=true;
     csvPlayer.stopAndJoin();

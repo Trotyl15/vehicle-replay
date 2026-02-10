@@ -56,5 +56,6 @@
         "stack": "cpp",
         "unordered_map": "cpp",
         "variant": "cpp"
-    }
+    },
+    "cmake.sourceDirectory": "/Users/amyhu/Desktop/vehicle-replay/dependencies/include/glm"
 }

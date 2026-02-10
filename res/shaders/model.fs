@@ -16,15 +16,23 @@ struct Light {
 
 uniform Material material;
 uniform vec3 carColor;
-uniform bool isCarPaint;  // New uniform to identify CarPaint material
+uniform bool isCarPaint;
+uniform bool hasDiffuseTexture;
+uniform sampler2D texture_diffuse1;
 uniform Light light;
 uniform vec3 viewPos;
 
 in vec3 FragPos;
 in vec3 Normal;
+in vec2 TexCoords;
 
 void main() {
-    if (material.baseColor.a < 0.01) discard;
+    // Get base color from texture or material
+    vec4 baseCol = material.baseColor;
+    if (hasDiffuseTexture) {
+        baseCol = texture(texture_diffuse1, TexCoords);
+    }
+    if (baseCol.a < 0.01) discard;
     
     // Calculate lighting
     vec3 norm = normalize(Normal);
@@ -33,15 +41,15 @@ void main() {
     vec3 reflectDir = reflect(-lightDir, norm);
     
     // Ambient
-    vec3 ambient = light.ambient * material.baseColor.rgb;
+    vec3 ambient = light.ambient * baseCol.rgb;
     
     // Diffuse
     float diff = max(dot(norm, lightDir), 0.0);
-    vec3 diffuse = light.diffuse * diff * material.baseColor.rgb;
+    vec3 diffuse = light.diffuse * diff * baseCol.rgb;
     
     // Specular
     float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32.0);
-    vec3 specular = light.specular * spec * material.baseColor.rgb;
+    vec3 specular = light.specular * spec * baseCol.rgb;
     
     // Combine lighting
     vec3 result = ambient + diffuse + specular;
@@ -51,5 +59,5 @@ void main() {
         result *= carColor;
     }
     
-    FragColor = vec4(result, material.baseColor.a);
+    FragColor = vec4(result, baseCol.a);
 }

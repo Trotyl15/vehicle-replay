@@ -4,3 +4,4 @@ app.dSYM
 .env
 *.pb.cc
 *.pb.h
+map_cache

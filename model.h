@@ -172,6 +172,10 @@ private:
         mat.metallic = metallic;
         mat.roughness = roughness;
 
+        // Load diffuse textures
+        vector<Texture> diffuseMaps = loadMaterialTextures(material, aiTextureType_DIFFUSE, "texture_diffuse");
+        textures.insert(textures.end(), diffuseMaps.begin(), diffuseMaps.end());
+
         // Store the material in the mesh
         return Mesh(vertices, indices, textures, mat);
     }
