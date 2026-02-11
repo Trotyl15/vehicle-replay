@@ -342,6 +342,7 @@ private:
             int idxHead = idxOf("Heading");
             if (idxHead < 0) idxHead = idxOf("ground_track_deg");
             if (idxHead < 0) idxHead = idxOf("vehicle_heading_deg");
+            if (idxHead < 0) idxHead = idxOf("gps_heading_deg");
 
             if(timeIndex<0||idxLat<0||idxLon<0||idxHead<0){
                 std::cerr << "CSVPlayer: header missing required fields (need Time/timestamp_us, Latitude/lat_synth, Longitude/lon_synth, Heading/vehicle_heading_deg)\n";
@@ -938,6 +939,14 @@ int main()
 
             // Camera Lock Status
             ImGui::Text("Camera: %s", cameraLocked ? "Locked (Press 'L' to unlock)" : "Free (Press 'L' to lock)");
+
+            ImGui::Separator();
+
+            // Track Path Controls
+            ImGui::Text("Track Path:");
+            if (ImGui::Button("Clear Path")) {
+                trackPoints.clear();
+            }
 
             ImGui::Separator();
 
