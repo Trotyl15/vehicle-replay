@@ -1,0 +1,17 @@
+{
+  "session_timestamp": "20260308_173009",
+  "start_time": "2026-03-08T17:30:09.585652",
+  "time_source": "data_logger",
+  "requested_start_offset_us": 2363196,
+  "monotonic_epoch_ns": 793582962859,
+  "start_elapsed_us": 2363979,
+  "cameras": [
+    0,
+    2
+  ],
+  "image_interval": 0.1,
+  "image_quality": 100,
+  "image_format": ".jpg",
+  "end_time": "2026-03-08T17:30:36.515409",
+  "end_elapsed_us": 29293742
+}

@@ -3,37 +3,42 @@
 ![PixPin_2025-06-04_18-39-25-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/ba72a7c0-5020-456a-995a-163d8a435607)
 
 
-## 1 · Install Homebrew packages
+## 1 · Install Homebrew packages
 
 ```bash
-# Apple Silicon  (replace /opt/homebrew with /usr/local on Intel)
+# Apple Silicon  (replace /opt/homebrew with /usr/local on Intel)
 brew install \
-  protobuf           # protoc + libprotobuf 6.x
-  abseil             # Abseil‑C++ libs required by protobuf
-  openssl@3          # TLS backend for libwebsockets
-  libwebsockets      # WebSocket client library
-  pkg-config         # pulls correct cflags / libs
+  protobuf \
+  abseil \
+  openssl@3 \
+  libwebsockets \
+  pkg-config \
+  glfw \
+  assimp
 ```
 
-<details>
-<summary>Optional (if you don’t bundle these dylibs)</summary>
+> `glfw` and `assimp` are required at runtime — the bundled dylibs in `dependencies/library/` embed Homebrew install-name paths that must be resolvable on your machine.
 
-```bash
-brew install glfw assimp glm   # graphics stack
-```
-
-</details>
+> **assimp version note:** Homebrew currently ships assimp 6.x, but the bundled library carries a `libassimp.5` install name. After building (step 4), patch the binary once:
+> ```bash
+> install_name_tool -change \
+>   /opt/homebrew/opt/assimp/lib/libassimp.5.dylib \
+>   /opt/homebrew/opt/assimp/lib/libassimp.6.dylib \
+>   ./app
+> ```
+> If a future Homebrew update changes the version again, adjust the path on the right-hand side accordingly.
 
 
 ## 2 · Generate protobuf sources
-If you dirst clone this repo or ever add or edit a .proto, run once:
 
-```
+If you first clone this repo or ever add or edit a `.proto`, run once:
+
+```bash
 protoc -I . --cpp_out=. car_pose.proto
 ```
 
 
-## 3 · Configure workspace path
+## 3 · Configure workspace path
 
 Create a file called **`.env`** in the repo root:
 
@@ -41,13 +46,13 @@ Create a file called **`.env`** in the repo root:
 WORKSPACE_PATH=/absolute/path/to/vehicle-replay
 ```
 
-Change the value after `=` to the real location of **this** repository (e.g. `/Users/<you>/Projects/vehicle-replay`).
+Change the value after `=` to the real location of **this** repository (e.g. `/Users/<you>/Projects/vehicle-replay`).
 
 
-## 4 · Build & run
+## 4 · Build & run
 
 ```bash
-# compile — VS Code ⇧⌘B also works
+# compile — VS Code ⇧⌘B also works
 ./build.sh
 
 # launch viewer

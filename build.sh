@@ -26,7 +26,7 @@ clang++ -std=c++17 -fcolor-diagnostics -Wall -fansi-escape-codes -g \
     ${WORKSPACE}/imgui/imgui_impl_glfw.cpp \
     ${WORKSPACE}/imgui/imgui_impl_opengl3.cpp \
     ${WORKSPACE}/dependencies/library/libglfw.3.4.dylib \
-    ${WORKSPACE}/dependencies/library/libassimp.5.4.3.dylib \
+    /opt/homebrew/opt/assimp/lib/libassimp.dylib \
     -lwebsockets \
     $(pkg-config --cflags protobuf absl_log) \
     $(pkg-config --libs protobuf absl_log) \

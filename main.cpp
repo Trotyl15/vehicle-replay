@@ -51,6 +51,8 @@ Assimp::Importer importer;
 ImGui::FileBrowser mFileDialog;
 std::string mCurrentFile = "< ... >";
 std::string mSelectedCsvPath;
+ImGui::FileBrowser mTrackFileDialog;
+std::string mCurrentTrackFile = "< ... >";
 
 // Track visualization
 std::deque<glm::vec3> trackPoints;
@@ -77,6 +79,11 @@ bool wasLocked = false;  // Track if camera was previously locked
 bool isDragging = false;  // Track if we're currently dragging
 glm::vec2 lastDragPos;   // Last mouse position during drag
 
+// Mini top-down overlay
+GLuint minimapFBO = 0, minimapTex = 0, minimapRBO = 0;
+constexpr int MINIMAP_SIZE = 180;
+bool showMinimap = true;
+
 // Map tile manager
 MapTileManager mapTiles;
 GLuint mapTileVAO = 0, mapTileVBO = 0;
@@ -85,10 +92,24 @@ double currentLat = 0.0, currentLon = 0.0;  // current GPS for UI display
 
 // Traffic cone placement
 Model* coneModel = nullptr;
-std::vector<glm::vec3> conePlacements;  // world-space positions of placed cones
+std::vector<glm::vec3> conePlacements;  // world-space positions of manually placed cones
+std::vector<glm::dvec2> coneLatLons;   // GPS (lat, lon) for track-CSV cones — rendered at runtime
 bool showConeContextMenu = false;
 glm::vec3 pendingConePos(0.0f);         // world pos under the right-click
 ImVec2 viewportOrigin(0,0);             // screen pos of the 3D viewport origin
+
+// ── Camera session viewer ──────────────────────────────────
+struct CameraFrame { uint64_t sessionUs; std::string filepath; };
+struct CameraFeed  { int camId; std::vector<CameraFrame> frames; };
+std::vector<CameraFeed> cameraFeeds;
+int    selectedCameraFeed = 0;
+GLuint cameraTexture      = 0;
+int    camTexWidth        = 1, camTexHeight = 1;
+int    lastCameraFrameIdx = -1;
+bool   showCameraView     = true;
+std::string mCurrentSession = "< ... >";
+ImGui::FileBrowser mSessionDialog{ImGuiFileBrowserFlags_SelectDirectory |
+                                   ImGuiFileBrowserFlags_HideRegularFiles};
 
 // Function to update camera position and orientation
 void updateCamera() {
@@ -204,6 +225,148 @@ inline glm::dvec2 llToENU(double lat, double lon)
     return { east, north };
 }
 
+// Load traffic cone positions from a track CSV (Cone #, Lat, Lon, Alt).
+// Converts each cone's GPS coordinate to world-space and populates conePlacements.
+void loadTrackCones(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "loadTrackCones: cannot open " << path << "\n";
+        return;
+    }
+
+    std::string line;
+    if (!std::getline(file, line)) return;
+
+    // Parse header to locate Lat/Lon columns (case-insensitive match)
+    std::istringstream headerStream(line);
+    std::string col;
+    std::vector<std::string> columns;
+    while (std::getline(headerStream, col, ',')) {
+        col.erase(0, col.find_first_not_of(" \t\r\n"));
+        col.erase(col.find_last_not_of(" \t\r\n") + 1);
+        columns.push_back(col);
+    }
+
+    int latCol = -1, lonCol = -1;
+    for (int i = 0; i < (int)columns.size(); ++i) {
+        std::string lower = columns[i];
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower == "lat" || lower == "latitude")  latCol = i;
+        if (lower == "lon" || lower == "longitude") lonCol = i;
+    }
+
+    if (latCol < 0 || lonCol < 0) {
+        std::cerr << "loadTrackCones: CSV missing Lat/Lon columns\n";
+        return;
+    }
+
+    coneLatLons.clear();
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        std::istringstream rowStream(line);
+        std::string cell;
+        std::vector<std::string> cells;
+        while (std::getline(rowStream, cell, ','))
+            cells.push_back(cell);
+
+        if ((int)cells.size() <= std::max(latCol, lonCol)) continue;
+
+        try {
+            double lat = std::stod(cells[latCol]);
+            double lon = std::stod(cells[lonCol]);
+            coneLatLons.push_back({lat, lon});
+        } catch (...) {
+            continue;
+        }
+    }
+    std::cout << "loadTrackCones: loaded " << coneLatLons.size() << " cones from " << path << "\n";
+}
+
+// ───────────────────────────────────────────────────────────
+// Camera session helpers
+// ───────────────────────────────────────────────────────────
+
+// Upload a JPEG to a GL_TEXTURE_2D, (re)creating it if texId == 0.
+void loadTextureFromFile(const std::string& path, GLuint& texId, int& outW, int& outH) {
+    int w, h, ch;
+    unsigned char* data = stbi_load(path.c_str(), &w, &h, &ch, 3);
+    if (!data) { std::cerr << "Camera: cannot load " << path << "\n"; return; }
+    if (texId == 0) glGenTextures(1, &texId);
+    glBindTexture(GL_TEXTURE_2D, texId);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    stbi_image_free(data);
+    outW = w; outH = h;
+}
+
+// Binary search: index of the frame whose session_us is closest to ts.
+int findClosestCameraFrame(const CameraFeed& feed, uint64_t ts) {
+    if (feed.frames.empty()) return -1;
+    if (ts <= feed.frames.front().sessionUs) return 0;
+    if (ts >= feed.frames.back().sessionUs) return (int)feed.frames.size() - 1;
+    size_t lo = 0, hi = feed.frames.size() - 1;
+    while (lo + 1 < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (feed.frames[mid].sessionUs <= ts) lo = mid; else hi = mid;
+    }
+    uint64_t d0 = ts - feed.frames[lo].sessionUs;
+    uint64_t d1 = feed.frames[hi].sessionUs - ts;
+    return (int)(d0 <= d1 ? lo : hi);
+}
+
+// Scan sessionDir for camera_N subdirectories and load their index CSVs.
+void loadCameraSession(const std::string& sessionDir) {
+    namespace fs = std::filesystem;
+    cameraFeeds.clear();
+    selectedCameraFeed  = 0;
+    lastCameraFrameIdx  = -1;
+
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator(sessionDir, ec)) {
+        if (!entry.is_directory()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.size() < 8 || name.substr(0, 7) != "camera_") continue;
+        int camId;
+        try { camId = std::stoi(name.substr(7)); } catch (...) { continue; }
+
+        std::string indexPath = entry.path().string()
+                              + "/cam" + std::to_string(camId) + "_index.csv";
+        std::ifstream f(indexPath);
+        if (!f.is_open()) continue;
+
+        CameraFeed feed;
+        feed.camId = camId;
+        std::string line;
+        std::getline(f, line); // skip header: frame_idx,filename,session_us,wall_utc_iso
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            if (line.back() == '\r') line.pop_back();
+            std::istringstream ss(line);
+            std::string cell;
+            std::vector<std::string> cells;
+            while (std::getline(ss, cell, ',')) cells.push_back(cell);
+            if (cells.size() < 3) continue;
+            try {
+                CameraFrame fr;
+                fr.sessionUs = std::stoull(cells[2]);
+                fr.filepath  = entry.path().string() + "/" + cells[1];
+                feed.frames.push_back(std::move(fr));
+            } catch (...) {}
+        }
+        if (!feed.frames.empty()) cameraFeeds.push_back(std::move(feed));
+    }
+    std::sort(cameraFeeds.begin(), cameraFeeds.end(),
+              [](const CameraFeed& a, const CameraFeed& b){ return a.camId < b.camId; });
+    std::cout << "loadCameraSession: " << cameraFeeds.size()
+              << " feed(s) from " << sessionDir << "\n";
+}
+
 // ───────────────────────────────────────────────────────────
 // shared pose from WS & CSV threads
 // ───────────────────────────────────────────────────────────
@@ -275,6 +438,14 @@ public:
                 currentMinutes, currentSeconds, totalMinutes, totalSeconds);
         return std::string(buffer);
     }
+
+    // Raw timestamp_us of the current row — used to synchronise camera frames.
+    uint64_t getCurrentTimestampUs() const {
+        size_t row = currentRow.load();
+        if (timeIndex >= 0 && row < rows.size())
+            try { return std::stoull(rows[row][timeIndex]); } catch (...) {}
+        return 0;
+    }
     
     void seekTo(float progress) {
         if (totalTime <= 0.0) return;
@@ -337,15 +508,18 @@ private:
 
             int idxLat  = idxOf("Latitude");
             if (idxLat < 0) idxLat = idxOf("lat_synth");
+            if (idxLat < 0) idxLat = idxOf("lat");
             int idxLon  = idxOf("Longitude");
             if (idxLon < 0) idxLon = idxOf("lon_synth");
+            if (idxLon < 0) idxLon = idxOf("lon");
             int idxHead = idxOf("Heading");
             if (idxHead < 0) idxHead = idxOf("ground_track_deg");
             if (idxHead < 0) idxHead = idxOf("vehicle_heading_deg");
             if (idxHead < 0) idxHead = idxOf("gps_heading_deg");
+            if (idxHead < 0) idxHead = idxOf("heading");
 
             if(timeIndex<0||idxLat<0||idxLon<0||idxHead<0){
-                std::cerr << "CSVPlayer: header missing required fields (need Time/timestamp_us, Latitude/lat_synth, Longitude/lon_synth, Heading/vehicle_heading_deg)\n";
+                std::cerr << "CSVPlayer: header missing required fields (need Time/timestamp_us, Latitude/lat_synth/lat, Longitude/lon_synth/lon, Heading/heading)\n";
                 return;
             }
             // Reset the origin so it recalculates from this dataset
@@ -355,10 +529,16 @@ private:
             // read rest of file
             while(std::getline(ifs,line)){
                 if(line.empty()||line[0]=='#') continue;
+                // Strip Windows-style \r if present
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
                 std::vector<std::string> row; row.reserve(headers.size());
                 std::stringstream ss(line);
                 std::string cell;
                 while(std::getline(ss,cell,',')) row.push_back(cell);
+                // CSV rows ending with a trailing comma parse to one fewer field
+                // than the header — pad the missing trailing empty field
+                while (row.size() < headers.size()) row.push_back("");
                 if(row.size()==headers.size()) rows.push_back(std::move(row));
             }
             
@@ -374,6 +554,21 @@ private:
                 currentTime = 0.0;
             }
             
+            // Snap car to the route start before playback begins (same logic as
+            // end-of-loop pre-publish) so the first run's trace is clean.
+            for (const auto& firstRow : rows) {
+                if (firstRow[idxLat].empty() || firstRow[idxLon].empty()) continue;
+                double fLat = std::stod(firstRow[idxLat]);
+                double fLon = std::stod(firstRow[idxLon]);
+                if (fLat == 0.0 && fLon == 0.0) continue;
+                double fHead = firstRow[idxHead].empty() ? 0.0 : std::stod(firstRow[idxHead]);
+                Pose p; p.lat = fLat; p.lon = fLon;
+                p.head = fHead * DEG2RAD; p.valid = true;
+                { std::lock_guard lk(poseMtx); pose = p; }
+                break;
+            }
+            snapRequested = true;
+
             // Playback rows
             double prevSimT = 0.0;
             bool first = true;
@@ -395,8 +590,10 @@ private:
                     // so heading is computed correctly from the start
                     hasLastGps = false;
                     for (size_t back = i; back > 0; --back) {
-                        double bLat = std::stod(rows[back-1][idxLat]);
-                        double bLon = std::stod(rows[back-1][idxLon]);
+                        const auto& bRow = rows[back-1];
+                        if (bRow[idxLat].empty() || bRow[idxLon].empty()) continue;
+                        double bLat = std::stod(bRow[idxLat]);
+                        double bLon = std::stod(bRow[idxLon]);
                         if (bLat != 0.0 || bLon != 0.0) {
                             lastGpsLat = bLat; lastGpsLon = bLon;
                             hasLastGps = true;
@@ -422,9 +619,10 @@ private:
                 }
                 prevSimT = simT; first=false;
 
+                // Skip rows with no GPS data (e.g. Imu/Heartbeat rows in raw format)
+                if (r[idxLat].empty() || r[idxLon].empty()) continue;
                 double lat = std::stod(r[idxLat]);
                 double lon = std::stod(r[idxLon]);
-                // Skip rows with invalid (zero) GPS coordinates
                 if (lat == 0.0 && lon == 0.0) continue;
 
                 Pose p; p.lat = lat; p.lon = lon;
@@ -441,11 +639,11 @@ private:
                         p.head = bearing;  // already in radians, 0=North, +CW
                     } else {
                         // Not enough movement, use column value as fallback
-                        double headingVal = std::stod(r[idxHead]);
+                        double headingVal = r[idxHead].empty() ? 0.0 : std::stod(r[idxHead]);
                         p.head = headingVal * DEG2RAD;
                     }
                 } else {
-                    double headingVal = std::stod(r[idxHead]);
+                    double headingVal = r[idxHead].empty() ? 0.0 : std::stod(r[idxHead]);
                     p.head = headingVal * DEG2RAD;
                 }
                 lastGpsLat = lat; lastGpsLon = lon; hasLastGps = true;
@@ -457,6 +655,21 @@ private:
                 }
             }
             if(!loop) break;
+            // Pre-publish the first valid GPS row of the new loop so that
+            // the main-thread snap lands at the route start (not the route
+            // end), preventing a spurious "return" line in the track trace.
+            for (const auto& firstRow : rows) {
+                if (firstRow[idxLat].empty() || firstRow[idxLon].empty()) continue;
+                double fLat = std::stod(firstRow[idxLat]);
+                double fLon = std::stod(firstRow[idxLon]);
+                if (fLat == 0.0 && fLon == 0.0) continue;
+                double fHead = firstRow[idxHead].empty() ? 0.0 : std::stod(firstRow[idxHead]);
+                Pose p; p.lat = fLat; p.lon = fLon;
+                p.head = fHead * DEG2RAD; p.valid = true;
+                { std::lock_guard lk(poseMtx); pose = p; }
+                break;
+            }
+            snapRequested = true;  // main thread will snap modelPos to start + clear trackPoints
             currentRow = 0;  // Reset for next loop
             currentTime = 0.0;
         }
@@ -805,6 +1018,28 @@ int main()
         std::cout << "ERROR::FRAMEBUFFER:: Framebuffer is not complete!" << std::endl;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    // ── Minimap framebuffer (fixed size, always top-down) ────────────────
+    {
+        glGenFramebuffers(1, &minimapFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, minimapFBO);
+
+        glGenTextures(1, &minimapTex);
+        glBindTexture(GL_TEXTURE_2D, minimapTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, MINIMAP_SIZE, MINIMAP_SIZE, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, minimapTex, 0);
+
+        glGenRenderbuffers(1, &minimapRBO);
+        glBindRenderbuffer(GL_RENDERBUFFER, minimapRBO);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, MINIMAP_SIZE, MINIMAP_SIZE);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, minimapRBO);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            std::cout << "ERROR::MINIMAP_FBO not complete!\n";
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
     std::cout << "Entering main loop..." << std::endl;
     while(!glfwWindowShouldClose(win))
     {
@@ -852,6 +1087,27 @@ int main()
 
             mFileDialog.SetTitle("Open csv");
             mFileDialog.SetTypeFilters({ ".csv" });
+            ImGui::Separator();
+
+            // Track CSV (cone positions)
+            ImGui::Text("Track CSV:");
+            ImGui::SameLine();
+            if (ImGui::Button("Select Track CSV"))
+                mTrackFileDialog.Open();
+            ImGui::SameLine();
+            ImGui::Text("%s", mCurrentTrackFile.c_str());
+            mTrackFileDialog.SetTitle("Open track csv");
+            mTrackFileDialog.SetTypeFilters({ ".csv" });
+            ImGui::Separator();
+
+            // Camera session (for synchronised video playback)
+            ImGui::Text("Cam Session:");
+            ImGui::SameLine();
+            if (ImGui::Button("Select Session"))
+                mSessionDialog.Open();
+            ImGui::SameLine();
+            ImGui::Text("%s", mCurrentSession.c_str());
+            mSessionDialog.SetTitle("Select Camera Session Folder");
             ImGui::Separator();
 
             // Camera View Selection
@@ -977,6 +1233,23 @@ int main()
                     csvPlayer.play(file_path, true); // loop playback
                 }
                 mFileDialog.ClearSelected();
+            }
+
+            mTrackFileDialog.Display();
+            if (mTrackFileDialog.HasSelected())
+            {
+                auto file_path = mTrackFileDialog.GetSelected().string();
+                mCurrentTrackFile = file_path.substr(file_path.find_last_of("/\\") + 1);
+                loadTrackCones(file_path);
+                mTrackFileDialog.ClearSelected();
+            }
+
+            mSessionDialog.Display();
+            if (mSessionDialog.HasSelected()) {
+                auto dir = mSessionDialog.GetSelected().string();
+                mCurrentSession = std::filesystem::path(dir).filename().string();
+                loadCameraSession(dir);
+                mSessionDialog.ClearSelected();
             }
         }
 
@@ -1115,22 +1388,156 @@ int main()
             modelShader->setMat4("model", model);
             car->Draw(*modelShader);
 
-            // Render placed traffic cones
+            // Render traffic cones
             if (coneModel) {
-                // Reuse model shader with an orange color for cones
                 glm::vec3 coneColor(1.0f, 0.35f, 0.0f);  // safety orange
                 modelShader->setVec3("carColor", coneColor);
+
+                // Manually placed cones (world-space positions)
                 for (auto& cpos : conePlacements) {
                     model = glm::mat4(1.0f);
                     model = glm::translate(model, cpos);
-                    model = glm::scale(model, glm::vec3(0.003f));  // OBJ is in cm, scale down
+                    model = glm::scale(model, glm::vec3(0.003f));
                     modelShader->setMat4("model", model);
                     coneModel->Draw(*modelShader);
+                }
+
+                // Track-CSV cones — computed from lat/lon every frame so they're
+                // always in sync with whichever GPS origin is currently active.
+                if (originSet) {
+                    for (auto& ll : coneLatLons) {
+                        glm::dvec2 enu = llToENU(ll.x, ll.y);
+                        glm::vec3 cpos(
+                            (float)(enu.x * 0.025),
+                            2.0f,
+                            (float)(-enu.y * 0.025));
+                        model = glm::mat4(1.0f);
+                        model = glm::translate(model, cpos);
+                        model = glm::scale(model, glm::vec3(0.003f));
+                        modelShader->setMat4("model", model);
+                        coneModel->Draw(*modelShader);
+                    }
                 }
             }
 
             // Reset framebuffer
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+            // ── Minimap render pass (top-down orthographic) ──────────────
+            if (showMinimap) {
+                glBindFramebuffer(GL_FRAMEBUFFER, minimapFBO);
+                glViewport(0, 0, MINIMAP_SIZE, MINIMAP_SIZE);
+                glClearColor(0.08f, 0.08f, 0.12f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                const float mmHalf  = 1.5f;  // world-unit half-extent shown around car
+                glm::vec3   mmCamPos = modelPos + glm::vec3(0.0f, 8.0f, 0.0f);
+                glm::mat4   mmView   = glm::lookAt(mmCamPos, modelPos, glm::vec3(0.0f, 0.0f, -1.0f));
+                glm::mat4   mmProj   = glm::ortho(-mmHalf, mmHalf, -mmHalf, mmHalf, 0.1f, 20.0f);
+
+                // Map tiles (reuse list already populated by main pass)
+                if (mapTiles.enabled && mapTileShader) {
+                    glm::mat4 mmVP = mmProj * mmView;
+                    mapTileShader->use();
+                    mapTileShader->setInt("uTileTex", 0);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindVertexArray(mapTileVAO);
+                    const float tileY = 2.0f;
+                    for (auto& tile : mapTiles.tileRenderList) {
+                        float verts[] = {
+                            tile.x0, tileY, tile.z0,  0.0f, 0.0f,
+                            tile.x1, tileY, tile.z0,  1.0f, 0.0f,
+                            tile.x1, tileY, tile.z1,  1.0f, 1.0f,
+                            tile.x0, tileY, tile.z0,  0.0f, 0.0f,
+                            tile.x1, tileY, tile.z1,  1.0f, 1.0f,
+                            tile.x0, tileY, tile.z1,  0.0f, 1.0f,
+                        };
+                        mapTileShader->setMat4("uVP", mmVP);
+                        glBindTexture(GL_TEXTURE_2D, tile.tex);
+                        glBindBuffer(GL_ARRAY_BUFFER, mapTileVBO);
+                        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+                        glDrawArrays(GL_TRIANGLES, 0, 6);
+                    }
+                    glBindVertexArray(0);
+                }
+
+                // Grid (only when map tiles are disabled)
+                glm::mat4 mmModel = glm::mat4(1.0f);
+                if (!mapTiles.enabled) {
+                    gridShader->use();
+                    glm::mat4 gVP = mmProj * mmView * mmModel;
+                    glUniformMatrix4fv(glGetUniformLocation(gridShader->ID, "gVP"), 1, GL_FALSE, glm::value_ptr(gVP));
+                    glUniform3fv(glGetUniformLocation(gridShader->ID, "gCameraWorldPos"), 1, glm::value_ptr(mmCamPos));
+                    glBindVertexArray(VAO);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                }
+
+                // Track lines
+                if (trackPoints.size() > 1) {
+                    trackShader->use();
+                    trackShader->setMat4("projection", mmProj);
+                    trackShader->setMat4("view", mmView);
+                    trackShader->setMat4("model", glm::mat4(1.0f));
+                    trackShader->setVec4("trackColor", glm::vec4(11.0f/255.0f, 48.0f/255.0f, 47.0f/255.0f, 1.0f));
+                    glBindVertexArray(trackVAO);
+                    glBindBuffer(GL_ARRAY_BUFFER, trackVBO);
+                    std::vector<glm::vec3> mmPts(trackPoints.begin(), trackPoints.end());
+                    std::vector<glm::vec3> mmQuads;
+                    const float tw = 0.03f, ov = 0.005f, hy = 0.001f;
+                    for (size_t i = 0; i + 1 < mmPts.size(); ++i) {
+                        glm::vec3 a = mmPts[i];     a.y += hy;
+                        glm::vec3 b = mmPts[i + 1]; b.y += hy;
+                        glm::vec3 d = glm::normalize(b - a);
+                        glm::vec3 p = glm::normalize(glm::cross(d, glm::vec3(0,1,0))) * tw;
+                        glm::vec3 e = d * ov;
+                        mmQuads.push_back(a + p - e); mmQuads.push_back(a - p - e); mmQuads.push_back(b + p + e);
+                        mmQuads.push_back(a - p - e); mmQuads.push_back(b - p + e); mmQuads.push_back(b + p + e);
+                    }
+                    glBufferData(GL_ARRAY_BUFFER, mmQuads.size() * sizeof(glm::vec3), mmQuads.data(), GL_DYNAMIC_DRAW);
+                    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)mmQuads.size());
+                    glBindVertexArray(0);
+                }
+
+                // Car model
+                modelShader->use();
+                modelShader->setMat4("projection", mmProj);
+                modelShader->setMat4("view", mmView);
+                modelShader->setVec3("carColor", carColor);
+                modelShader->setVec3("viewPos", mmCamPos);
+                modelShader->setVec3("light.direction", light.direction);
+                modelShader->setVec3("light.ambient",   light.ambient);
+                modelShader->setVec3("light.diffuse",   light.diffuse);
+                modelShader->setVec3("light.specular",  light.specular);
+                mmModel = glm::mat4(1.0f);
+                mmModel = glm::translate(mmModel, modelPos);
+                mmModel = glm::scale(mmModel, glm::vec3(0.03f));
+                mmModel = glm::rotate(mmModel, glm::radians(modelYaw), glm::vec3(0.0f, 1.0f, 0.0f));
+                modelShader->setMat4("model", mmModel);
+                car->Draw(*modelShader);
+
+                // Traffic cones
+                if (coneModel) {
+                    modelShader->setVec3("carColor", glm::vec3(1.0f, 0.35f, 0.0f));
+                    for (auto& cp : conePlacements) {
+                        mmModel = glm::translate(glm::mat4(1.0f), cp);
+                        mmModel = glm::scale(mmModel, glm::vec3(0.003f));
+                        modelShader->setMat4("model", mmModel);
+                        coneModel->Draw(*modelShader);
+                    }
+                    if (originSet) {
+                        for (auto& ll : coneLatLons) {
+                            glm::dvec2 enu = llToENU(ll.x, ll.y);
+                            glm::vec3 cp((float)(enu.x * 0.025), 2.0f, (float)(-enu.y * 0.025));
+                            mmModel = glm::translate(glm::mat4(1.0f), cp);
+                            mmModel = glm::scale(mmModel, glm::vec3(0.003f));
+                            modelShader->setMat4("model", mmModel);
+                            coneModel->Draw(*modelShader);
+                        }
+                    }
+                }
+
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            }
 
             // Display the rendered texture in ImGui with flipped UV coordinates
             // Record viewport position for mouse mapping
@@ -1139,6 +1546,45 @@ int main()
                         ImVec2(viewportWidth, viewportHeight),
                         ImVec2(0, 1),  // UV0: bottom-left
                         ImVec2(1, 0)); // UV1: top-right
+
+            // ── Minimap overlay + toggle ─────────────────────────────────
+            {
+                const float mmPad  = 10.0f;
+                const float mmSide = (float)MINIMAP_SIZE;
+                ImVec2 mmTL(viewportOrigin.x + mmPad, viewportOrigin.y + mmPad);
+                ImVec2 mmBR(mmTL.x + mmSide, mmTL.y + mmSide);
+                auto* dl = ImGui::GetWindowDrawList();
+
+                if (showMinimap) {
+                    // Drop-shadow background
+                    dl->AddRectFilled(
+                        ImVec2(mmTL.x - 2, mmTL.y - 2),
+                        ImVec2(mmBR.x + 2, mmBR.y + 2),
+                        IM_COL32(0, 0, 0, 200), 5.0f);
+                    // Minimap texture (flip UV: OpenGL origin is bottom-left)
+                    dl->AddImage(
+                        (ImTextureID)(uintptr_t)minimapTex,
+                        mmTL, mmBR, ImVec2(0, 1), ImVec2(1, 0));
+                    // Border
+                    dl->AddRect(
+                        ImVec2(mmTL.x - 2, mmTL.y - 2),
+                        ImVec2(mmBR.x + 2, mmBR.y + 2),
+                        IM_COL32(200, 200, 200, 160), 5.0f, 0, 1.5f);
+                    // Label
+                    dl->AddText(ImVec2(mmTL.x + 5, mmTL.y + 5),
+                                IM_COL32(255, 255, 255, 200), "Top-Down");
+                }
+
+                // Toggle checkbox — always visible below (or at top-left when hidden)
+                float cbY = showMinimap ? (mmBR.y + 5.0f) : (viewportOrigin.y + mmPad);
+                ImVec2 cbPos(mmTL.x, cbY);
+                // Semi-transparent pill so the checkbox is readable over any background
+                dl->AddRectFilled(cbPos,
+                    ImVec2(cbPos.x + 128.0f, cbPos.y + 22.0f),
+                    IM_COL32(0, 0, 0, 120), 4.0f);
+                ImGui::SetCursorScreenPos(cbPos);
+                ImGui::Checkbox("Top-Down View", &showMinimap);
+            }
 
             // ── Right-click to place cone ──
             if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
@@ -1182,8 +1628,11 @@ int main()
                 if (!conePlacements.empty() && ImGui::MenuItem("Remove Last Cone")) {
                     conePlacements.pop_back();
                 }
-                if (!conePlacements.empty() && ImGui::MenuItem("Clear All Cones")) {
+                if (!conePlacements.empty() && ImGui::MenuItem("Clear Manual Cones")) {
                     conePlacements.clear();
+                }
+                if (!coneLatLons.empty() && ImGui::MenuItem("Clear Track Cones")) {
+                    coneLatLons.clear();
                 }
                 ImGui::EndPopup();
             }
@@ -1256,34 +1705,42 @@ int main()
             }
 
             // Cone list
-            if (!conePlacements.empty()) {
+            size_t totalCones = conePlacements.size() + coneLatLons.size();
+            if (totalCones > 0) {
                 ImGui::Separator();
-                ImGui::Text("Traffic Cones (%zu):", conePlacements.size());
-                if (ImGui::BeginTable("ConeTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                    ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                ImGui::Text("Traffic Cones (%zu):", totalCones);
+                if (ImGui::BeginTable("ConeTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("#",      ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                    ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 50.0f);
                     ImGui::TableSetupColumn("Latitude");
                     ImGui::TableSetupColumn("Longitude");
                     ImGui::TableHeadersRow();
 
+                    // Track-CSV cones (from coneLatLons — show raw GPS directly)
+                    for (size_t i = 0; i < coneLatLons.size(); ++i) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn(); ImGui::Text("%zu", i + 1);
+                        ImGui::TableNextColumn(); ImGui::TextDisabled("CSV");
+                        ImGui::TableNextColumn(); ImGui::Text("%.8f", coneLatLons[i].x);
+                        ImGui::TableNextColumn(); ImGui::Text("%.8f", coneLatLons[i].y);
+                    }
+
+                    // Manually placed cones (reverse-project world pos → lat/lon)
                     double lat0Rad = LAT0 * DEG2RAD;
                     int removeIdx = -1;
                     for (size_t i = 0; i < conePlacements.size(); ++i) {
                         auto& cp = conePlacements[i];
-                        // Reverse ENU: world x = east*0.025, world z = -north*0.025
                         double east  = cp.x / 0.025;
                         double north = -cp.z / 0.025;
                         double lat = LAT0 + north / EARTH_R / DEG2RAD;
                         double lon = LON0 + east / (EARTH_R * cos(lat0Rad)) / DEG2RAD;
 
                         ImGui::TableNextRow();
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%zu", i + 1);
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%.8f", lat);
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%.8f", lon);
+                        ImGui::TableNextColumn(); ImGui::Text("%zu", coneLatLons.size() + i + 1);
+                        ImGui::TableNextColumn(); ImGui::TextDisabled("Man");
+                        ImGui::TableNextColumn(); ImGui::Text("%.8f", lat);
+                        ImGui::TableNextColumn(); ImGui::Text("%.8f", lon);
 
-                        // Right-click row to remove
                         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
                             removeIdx = (int)i;
                     }
@@ -1291,8 +1748,74 @@ int main()
                     if (removeIdx >= 0)
                         conePlacements.erase(conePlacements.begin() + removeIdx);
                 }
+
+                // Button to clear track CSV cones
+                if (!coneLatLons.empty() && ImGui::Button("Clear Track Cones"))
+                    coneLatLons.clear();
             }
             
+            ImGui::End();
+        }
+
+        // ── Camera view window ──────────────────────────────────────────
+        if (showCameraView) {
+            ImGui::Begin("Camera", &showCameraView);
+
+            if (cameraFeeds.empty()) {
+                ImGui::TextDisabled("No session loaded.");
+                ImGui::TextDisabled("Select a session folder in Settings.");
+            } else {
+                // Camera-feed selector tabs
+                for (int i = 0; i < (int)cameraFeeds.size(); ++i) {
+                    if (i > 0) ImGui::SameLine();
+                    std::string lbl = "Cam " + std::to_string(cameraFeeds[i].camId);
+                    bool isSelected = (i == selectedCameraFeed);
+                    if (isSelected)
+                        ImGui::PushStyleColor(ImGuiCol_Button,
+                            ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                    if (ImGui::SmallButton(lbl.c_str())) {
+                        selectedCameraFeed = i;
+                        lastCameraFrameIdx = -1; // force reload on switch
+                    }
+                    if (isSelected) ImGui::PopStyleColor();
+                }
+
+                // Sync image to current playback timestamp
+                if (selectedCameraFeed < (int)cameraFeeds.size()) {
+                    auto& feed = cameraFeeds[selectedCameraFeed];
+                    uint64_t ts = csvPlayer.getCurrentTimestampUs();
+                    int fi = findClosestCameraFrame(feed, ts);
+                    if (fi >= 0 && fi != lastCameraFrameIdx) {
+                        loadTextureFromFile(feed.frames[fi].filepath,
+                                            cameraTexture, camTexWidth, camTexHeight);
+                        lastCameraFrameIdx = fi;
+                    }
+                    // Frame counter
+                    ImGui::SameLine();
+                    if (fi >= 0)
+                        ImGui::TextDisabled("  frame %d / %d", fi + 1, (int)feed.frames.size());
+                }
+
+                ImGui::Separator();
+
+                // Image — fills available space while preserving aspect ratio
+                if (cameraTexture != 0) {
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    if (avail.x > 4.f && avail.y > 4.f) {
+                        float asp = (camTexHeight > 0)
+                                  ? (float)camTexWidth / (float)camTexHeight
+                                  : 16.0f / 9.0f;
+                        ImVec2 sz = (avail.x / asp <= avail.y)
+                                  ? ImVec2(avail.x, avail.x / asp)
+                                  : ImVec2(avail.y * asp, avail.y);
+                        ImGui::Image((ImTextureID)(uintptr_t)cameraTexture, sz,
+                                     ImVec2(0, 1), ImVec2(1, 0)); // flip Y: OpenGL origin is bottom-left
+                    }
+                } else {
+                    ImGui::TextDisabled("(no image loaded yet)");
+                }
+            }
+
             ImGui::End();
         }
 
@@ -1377,6 +1900,10 @@ int main()
 
     std::cout << "Cleaning up..." << std::endl;
     // Cleanup
+    if (minimapTex) glDeleteTextures(1, &minimapTex);
+    if (minimapRBO) glDeleteRenderbuffers(1, &minimapRBO);
+    if (minimapFBO) glDeleteFramebuffers(1, &minimapFBO);
+    if (cameraTexture) glDeleteTextures(1, &cameraTexture);
     delete gridShader;
     delete modelShader;
     delete trackShader;
