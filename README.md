@@ -1,6 +1,7 @@
 # Vehicle‑Replay
 
 ![PixPin_2025-06-04_18-39-25-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/ba72a7c0-5020-456a-995a-163d8a435607)
+<img width="3456" height="2168" alt="image" src="https://github.com/user-attachments/assets/9d549a13-6c2b-4401-bc20-c8a826b833e5" />
 
 
 ## 1 · Install Homebrew packages
